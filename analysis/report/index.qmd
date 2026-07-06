@@ -1,8 +1,8 @@
 ---
 title: "Research Backup Architecture: Ongoing System and GitHub Archival"
-author: "Ronald 'Ryy' G. Thomas"
+author: "Ronald G. Thomas"
 date: "2026-05-17"
-draft: false
+draft: true
 description: >
   A unified treatment of research backup architecture:
   the three-tier ongoing system (automated Git pushes,
