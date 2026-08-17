@@ -2,27 +2,15 @@
 title: "Research Backup Architecture: Ongoing System and GitHub Archival"
 author: "Ronald G. Thomas"
 date: "2026-05-17"
-draft: true
-description: >
-  A unified treatment of research backup architecture:
-  the three-tier ongoing system (automated Git pushes,
-  cloud sync, and Time Machine) and the bulk GitHub
-  archival procedure for migrating 400+ private
-  repositories to local storage with verified backups
-  and selective deletion.
 categories: [git, shell, macos, reproducibility]
+description: "A unified treatment of research backup architecture: the three-tier ongoing system (automated Git pushes, cloud sync, and Time Machine) and the bulk GitHub archival procedure for migrating 400+ private repositories to local storage with verified backups and selective deletion."
 image: "media/images/hero.png"
 document-type: "blog"
+draft: true
 execute:
   echo: true
   warning: false
   message: false
-format:
-  html:
-    toc: true
-    toc-depth: 3
-    code-fold: false
-    code-tools: false
 ---
 
 *2026-05-17 16:55 PDT*
@@ -131,7 +119,7 @@ architecture:
 Corrections and alternative approaches are welcome.
 
 ![A workspace ready for a focused archival
-session.](media/images/ambiance1.png){.img-fluid}
+session.](media/images/ambiance1.png){.img-fluid height=3.5in}
 
 # Prerequisites and Setup
 
@@ -754,7 +742,7 @@ tail -20 ~/Library/Logs/research_backup.log
 
 ![Terminal windows and backup logs -- the machinery
 behind automated research
-protection.](media/images/ambiance2.png){.img-fluid}
+protection.](media/images/ambiance2.png){.img-fluid height=3.5in}
 
 # Section 2: Bulk GitHub Account Archival
 
@@ -1273,7 +1261,7 @@ branches are present, and that the issue export
 is well-formed JSON.
 
 ![Organised workspace: the goal after archiving
-400 repos.](media/images/ambiance3.jpg){.img-fluid}
+400 repos.](media/images/ambiance3.jpg){.img-fluid height=3.5in}
 
 *After the archive, what remains on GitHub is clean
 and intentional.*
