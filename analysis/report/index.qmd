@@ -254,7 +254,7 @@ uncommitted changes, and pushes those changes to the
 remote.
 
 ```bash
-#!/opt/homebrew/bin/bash
+#!/usr/bin/env bash
 
 find "$HOME/prj" -name ".git" -type d \
     | while read git_dir; do
@@ -267,6 +267,13 @@ find "$HOME/prj" -name ".git" -type d \
         || git push origin master 2>/dev/null
 done
 ```
+
+The commit message here is a plain timestamp, not the
+imperative-mood style used for hand-written commits
+elsewhere on this site. That is deliberate: an unattended
+script has no "what changed and why" to report, so a
+timestamp is the more honest message. Do not use this
+style for a commit you write by hand.
 
 This works, but it lacks error handling, logging,
 user filtering, and any mechanism for diagnosing
@@ -282,7 +289,7 @@ through it in logical segments.
 ### Configuration and Argument Parsing
 
 ```bash
-#!/opt/homebrew/bin/bash
+#!/usr/bin/env bash
 
 RESEARCH_DIR="$HOME/prj/"
 LOG_FILE="$HOME/Library/Logs/research_backup.log"
@@ -807,7 +814,7 @@ it executable with `chmod +x github-archive.sh`.
 ### Script Header and Configuration
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 
