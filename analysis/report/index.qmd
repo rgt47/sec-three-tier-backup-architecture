@@ -64,7 +64,7 @@ platform.
 
 More formally, both components document the backup
 layer of the Workflow Construct described in
-[post 52](/posts/52-workflow-construct/). Post 52
+[A Workflow Construct for the Modern Data Scientist](../wf-construct-overview-anchor/). Post 52
 names backup as a load-bearing layer under the
 principle 'two tiers or it is not backup'; the
 configuration here implements three active tiers for
@@ -1531,15 +1531,15 @@ Main takeaways:
 
 **Related posts on this blog:**
 
-- [Configure the Command Line for Data Science
+- [Unix Command-Line Workspace Setup for Data Science
   Development](
-  /posts/01-configtermzsh/configtermzsh/analysis/report/index.qmd)
+  ../wf-unix-workspace-config/)
   -- the terminal and shell setup that complements
   this backup architecture.
-- [Setting Up Git for Data Science Development](
-  /posts/03-setupgit/setupgit/analysis/report/)
-- [Creating a GitHub Dotfiles Repository](
-  /posts/24-setupdotfilesongithub/setupdotfilesongithub/analysis/report/)
+- [Setting Up Git for Data Science Workflows](
+  ../wf-git-for-data-science/)
+- [Multi-Laptop macOS Bootstrap](
+  ../wf-multi-laptop-dotfiles-bootstrap/)
 
 **Key resources:**
 
@@ -1618,4 +1618,4 @@ I would enjoy hearing from you if:
 ---
 
 *Rendered on 2026-05-17 at 17:08 PDT.*<br>
-*Source: ~/prj/qblog/posts/02-githubarchive/githubarchive/analysis/report/index.qmd*
+*Source: ~/prj/rgtlab/posts/sec-three-tier-backup-architecture/index.qmd*
