@@ -4,7 +4,7 @@ author: "Ronald G. Thomas"
 date: "2026-05-17"
 categories: [git, shell, macos, reproducibility]
 description: "A unified treatment of research backup architecture: the three-tier ongoing system (automated Git pushes, cloud sync, and Time Machine) and the bulk GitHub archival procedure for migrating 400+ private repositories to local storage with verified backups and selective deletion."
-image: "media/images/hero.png"
+image: "media/images/hero.jpg"
 document-type: "blog"
 draft: true
 execute:
@@ -15,7 +15,9 @@ execute:
 
 *2026-05-17 16:55 PDT*
 
-![  ](media/images/hero.png){.img-fluid width=80% fig-align="center"}
+![Three identical small wooden boxes stacked in a staggered row on
+a shelf, each a different
+size.](media/images/hero.jpg){.img-fluid width=80% fig-align="center"}
 
 *Version control is the starting point; a backup
 architecture is the surrounding structure that makes
@@ -747,9 +749,9 @@ the log:
 tail -20 ~/Library/Logs/research_backup.log
 ```
 
-![Terminal windows and backup logs -- the machinery
-behind automated research
-protection.](media/images/ambiance2.png){.img-fluid height=3.5in}
+![A single external hard drive resting on a desk beside a coiled
+cable and a small paper luggage
+tag.](media/images/ambiance2.jpg){.img-fluid height=3.5in}
 
 # Section 2: Bulk GitHub Account Archival
 
