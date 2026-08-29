@@ -48,7 +48,7 @@ approaches to research backup:
 
 1. **An ongoing three-tier system** that runs
    automatically every 15 minutes, pushing all dirty
-   Git repositories to GitHub, synchronising files to
+   Git repositories to GitHub, synchronizing files to
    cloud storage, and relying on Time Machine for
    system-wide safety.
 2. **A bulk GitHub archival procedure** that creates
@@ -90,7 +90,7 @@ architecture:
 - A colleague's hard-drive failure, which erased
   months of analytical work, demonstrated that a
   single backup tier is never sufficient.
-- Cloud synchronisation provides file-level
+- Cloud synchronization provides file-level
   replication but does not preserve Git commit
   history or GitHub metadata.
 - An automated solution must handle hundreds of
@@ -178,7 +178,7 @@ architecture in this post has four components:
 1. **Automated Git commits and pushes** (every 15
    minutes) -- protects against uncommitted work and
    local corruption by pushing changes to GitHub.
-2. **Cloud synchronisation** (real-time via Google
+2. **Cloud synchronization** (real-time via Google
    Drive or Dropbox) -- provides continuous file-level
    replication across devices, useful for non-Git files
    and immediate access from other machines.
@@ -232,7 +232,7 @@ Git repositories.
 5. If prompted about encryption, choose Encrypt Backup
    for security.
 
-### Customise Exclusions
+### Customize Exclusions
 
 1. Click Options in Time Machine preferences.
 2. Add folders to exclude: Downloads, Trash, virtual
@@ -327,7 +327,7 @@ done
 Log rotation prevents the log file from growing
 without bound. The `log_message` function writes
 every event to disk and optionally echoes
-colour-coded output to the console when verbose mode
+color-coded output to the console when verbose mode
 is active.
 
 ```bash
@@ -390,7 +390,7 @@ pushing to collaborator remotes.
 `should_exclude_directory` skips archive and backup
 folders. `get_current_branch` and
 `branch_exists_on_remote` support intelligent push
-behaviour.
+behavior.
 
 ```bash
 check_remote() {
@@ -1161,7 +1161,7 @@ log "Archive process complete"
 ```
 
 Running the dry-run first is not merely useful; it
-is essential. The categorisation output can catch
+is essential. The categorization output can catch
 repos that were forgotten in the keep-list.
 
 Configure the `KEEP_ON_GITHUB` array to match your
@@ -1269,7 +1269,7 @@ valid, that metadata files are non-empty, that all
 branches are present, and that the issue export
 is well-formed JSON.
 
-![Organised workspace: the goal after archiving
+![Organized workspace: the goal after archiving
 400 repos.](media/images/ambiance3.jpg){.img-fluid height=3.5in}
 
 *After the archive, what remains on GitHub is clean
@@ -1385,7 +1385,7 @@ only copy.
 
 # What Did We Learn?
 
-## Lessons Learnt
+## Lessons Learned
 
 **Conceptual Understanding:**
 
@@ -1462,7 +1462,7 @@ only copy.
   `git lfs fetch --all` added to the backup function.
 - The archival script processes repositories
   sequentially. For 400+ repos, this can take several
-  hours. Parallelisation would speed things up but
+  hours. Parallelization would speed things up but
   adds complexity.
 - Time Machine requires the USB drive to be
   physically connected. When travelling without the
@@ -1477,7 +1477,7 @@ only copy.
    inserting `git lfs fetch --all` into the backup
    function for repositories that use large file
    storage.
-3. Parallelise the archival backup phase using
+3. Parallelize the archival backup phase using
    `xargs -P 4` or GNU `parallel` to clone multiple
    repositories concurrently, reducing total runtime.
 4. Export repository settings (branch protection
