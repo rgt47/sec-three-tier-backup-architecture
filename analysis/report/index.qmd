@@ -1,1623 +1,739 @@
 ---
-title: "Research Backup Architecture: Ongoing System and GitHub Archival"
+title: "Research Backup Architecture: Borg, Cloud Copies, and Time Machine"
 author: "Ronald G. Thomas"
 date: "2026-05-17"
-categories: [git, shell, macos, reproducibility]
-description: "A unified treatment of research backup architecture: the three-tier ongoing system (automated Git pushes, cloud sync, and Time Machine) and the bulk GitHub archival procedure for migrating 400+ private repositories to local storage with verified backups and selective deletion."
+categories: [security, backup, borg, rclone, macos, linux, reproducibility]
+description: "How a five-machine research fleet implements 3-2-1 backup: nightly encrypted Borg archives to a home server through restricted append-only keys, per-machine cloud copies with rclone, and an encrypted Time Machine share. Covers retention, restore testing, monitoring, and the failures that only reading logs revealed."
 image: "media/images/hero.jpg"
 document-type: "blog"
 draft: false
+cluster: security
+cluster-order: 5
 execute:
   echo: true
   warning: false
   message: false
 ---
 
-*2026-05-17 16:55 PDT*
+<!--
+AUTHOR NOTES
+  Post 5 of the security series. Owns: the backup architecture (Borg,
+  cloud copies, Time Machine policy), retention, restore testing,
+  monitoring, and the backup incidents as lessons. Server-side detail
+  (Samba share, external SSD, firewall, addressing) lives in
+  sec-five-machine-storage; the audit narrative lives in
+  sec-fleet-hardening-lessons.
+  Configuration excerpts are trimmed from the scripts in use; account
+  names and addresses are replaced with placeholders.
+-->
 
 ![Three identical small wooden boxes stacked in a staggered row on
 a shelf, each a different
 size.](media/images/hero.jpg){.img-fluid width=80% fig-align="center"}
 
-*Version control is the starting point; a backup
-architecture is the surrounding structure that makes
-it durable.*
+*Three copies, two kinds of media, one off site: the rule is old,
+and the hard part is knowing that all three are still current.*
 
 # Introduction
 
-GitHub alone is not a backup. That claim sounds
-counterintuitive when you have been committing and
-pushing faithfully for years, but it describes a real
-architectural gap. GitHub is a remote source-of-truth
-tier, not a backup tier: it holds one copy, operated
-by one company, under one pricing model, with no
-local fallback. A suspended account, a platform
-outage, or a credential compromise can sever access
-immediately.
+A research workstation accumulates material that cannot be
+regenerated: analysis code between commits, derived datasets that
+took days to compute, manuscripts in progress, and the credentials
+that unlock everything else. Version control protects some of this,
+but only what has been committed and pushed, and only the files that
+belong in a repository. A backup architecture covers the rest.
 
-The same gap appears at the local level. Manual `git
-push` commands get skipped during busy stretches. An
-external drive's Time Machine backup silently stops
-when the drive is not connected. Cloud sync replicates
-files but does not preserve commit history. Each tool
-covers one slice of the risk surface; none covers it
-entirely.
+::: {.callout-note}
+Part 5 of the security series; start with [Security Foundations for a Multi-Machine Research Fleet](../sec-multi-laptop-threat-model/) for the overview.
+:::
 
-This post brings together two complementary
-approaches to research backup:
+This post describes the backup architecture of a five-machine fleet:
+three Macs (julia, the primary workstation; athena, a laptop; joe, a
+secondary Mac), a Linux laptop (zeus), and a home server (mercury, a
+repurposed 2016 MacBook Pro running Linux Mint). It follows the
+familiar 3-2-1 rule with three independent mechanisms, each chosen
+for a different failure:
 
-1. **An ongoing three-tier system** that runs
-   automatically every 15 minutes, pushing all dirty
-   Git repositories to GitHub, synchronizing files to
-   cloud storage, and relying on Time Machine for
-   system-wide safety.
-2. **A bulk GitHub archival procedure** that creates
-   verified local mirrors of 400+ private repositories,
-   exports all GitHub-side metadata (issues, PRs,
-   releases, wikis), and supports selective deletion
-   after confirmed verification.
+- **Borg** archives every machine nightly to the home server,
+  encrypted, deduplicated, and versioned.
+- **Cloud copies** mirror the project tree from the two main Macs to
+  three cloud providers each night.
+- **Time Machine** keeps a full, encrypted, browsable history of the
+  laptop on a network share.
 
-Together they form a complete backup architecture:
-the ongoing system keeps the day-to-day workflow
-protected; the archival procedure handles the periodic
-task of mirroring GitHub itself, so that the source-
-of-truth tier survives the loss of the account or
-platform.
-
-More formally, both components document the backup
-layer of the Workflow Construct described in
-[A Workflow Construct for the Modern Data Scientist](../wf-construct-overview-anchor/). Post 52
-names backup as a load-bearing layer under the
-principle 'two tiers or it is not backup'; the
-configuration here implements three active tiers for
-daily use, plus a fourth archival leaf that mirrors
-GitHub off-platform.
+The design matters less than the operation. Every failure described
+near the end of this post was a backup that was scheduled, configured,
+and apparently working, and that had stopped doing its job. None of
+them produced an alert. All of them were found by reading logs and
+exit statuses by hand.
 
 ## Motivations
 
-The following considerations motivated this
-architecture:
-
-- Having 400+ private repositories on GitHub with no
-  local mirrors creates a single point of failure for
-  years of accumulated work.
-- Running `git push` manually and forgetting for days
-  at a time leaves important work vulnerable to local
-  disk failure.
-- A plain `git clone` captures code history but misses
-  issues, pull requests, releases, and wiki content
-  that can be more valuable than the code itself.
-- A colleague's hard-drive failure, which erased
-  months of analytical work, demonstrated that a
-  single backup tier is never sufficient.
-- Cloud synchronization provides file-level
-  replication but does not preserve Git commit
-  history or GitHub metadata.
-- An automated solution must handle hundreds of
-  repositories without manual intervention for each
-  one.
-- The archival script requires a dry-run mode so that
-  every action can be previewed before anything
-  destructive is attempted.
+- Git protects committed work, not the working tree, untracked data,
+  or the dotfiles that hold credentials.
+- A sync service is not a backup: it faithfully propagates deletions
+  and corruption to every copy.
+- A laptop can be lost, stolen, or wiped in an afternoon; the cost of
+  recovery should be hours, not weeks.
+- Credentials for one tier must not unlock another, so that a single
+  compromised machine cannot destroy every copy.
+- Backups that fail silently are worse than none, because they
+  produce false confidence.
 
 ## Objectives
 
-1. Configure Time Machine as a system-wide safety net
-   for files that live outside Git.
-2. Write and schedule a production-grade script that
-   commits and pushes all dirty Git repositories
-   automatically every 15 minutes.
-3. Build a bulk archival script that creates a full
-   mirror, portable bundle, wiki clone, and metadata
-   export for every private repository on a GitHub
-   account.
-4. Implement a verification phase that checks every
-   bundle with `git bundle verify` before any deletion
-   is permitted.
-5. Add a selective preservation mechanism so active
-   or shared repos remain on GitHub while dormant ones
-   are archived and removed.
-
-Corrections and alternative approaches are welcome.
-
-![A workspace ready for a focused archival
-session.](media/images/ambiance1.png){.img-fluid height=3.5in}
-
-# Prerequisites and Setup
-
-## For the Ongoing Backup System
-
-This guide assumes a macOS environment with the
-following tools available:
-
-- **macOS** 12 (Monterey) or later
-- **Homebrew Bash** (`/opt/homebrew/bin/bash`) --
-  macOS ships with Bash 3.2, but the scripts here use
-  Bash 4+ features
-- **Git** 2.30 or later, configured with SSH keys for
-  GitHub
-- **A USB external drive** (1 TB recommended) for
-  Time Machine
-- **A cloud sync service** (Google Drive, Dropbox, or
-  iCloud) for the third tier
-
-The research directory structure assumed throughout
-is `~/prj/`, containing all Git repositories. Adjust
-paths as needed for your own layout.
-
-## For the GitHub Archival Script
-
-Before running the archival script, three tools must
-be installed and authenticated:
-
-```bash
-gh auth status
-
-git --version
-
-df -h ~
-```
-
-The disk space check is worth doing early: 400
-repositories can require 20-40 GB depending on
-release asset history.
-
-You also need a GitHub personal access token with
-`repo` and `delete_repo` scopes if you plan to use
-the deletion phase. The `gh auth login` flow can
-configure this interactively. For backup-only runs,
-the standard `repo` scope is sufficient.
+1. Every machine is archived nightly to encrypted, versioned storage
+   on the home server, through a key that can add data but not delete
+   it.
+2. The project tree on the main workstations has independent off-site
+   copies with a recoverable history of deleted files.
+3. The laptop has a full system history suitable for a bare-metal
+   restore, encrypted at rest.
+4. Old archives are pruned on a documented schedule without placing
+   decryption keys on the storage host.
+5. Each tier is verified by restoring from it, and each job's exit
+   status is checked daily on every machine.
 
 # What is a Research Backup Architecture?
 
-A research backup architecture layers multiple
-independent protection mechanisms so that no single
-point of failure can result in data loss. The
-architecture in this post has four components:
+A backup architecture is a set of copies that fail independently. The
+3-2-1 rule asks for three copies of the data, on two different kinds
+of storage, with one copy off site. In this fleet the mapping is:
 
-1. **Automated Git commits and pushes** (every 15
-   minutes) -- protects against uncommitted work and
-   local corruption by pushing changes to GitHub.
-2. **Cloud synchronization** (real-time via Google
-   Drive or Dropbox) -- provides continuous file-level
-   replication across devices, useful for non-Git files
-   and immediate access from other machines.
-3. **Time Machine backups** (hourly, system-wide) --
-   captures the entire filesystem including system
-   settings, application data, and files not covered
-   by the other two tiers.
-4. **Periodic GitHub archival** (quarterly or before
-   any account change) -- creates verified local
-   mirrors of every private repository, exporting all
-   GitHub-side metadata that a plain `git clone` would
-   miss: issue threads, pull request discussions,
-   release binaries, labels, milestones, and wikis.
+| Copy | Mechanism | Storage | Location | Protects against |
+|---|---|---|---|---|
+| 1 | The working files | Internal SSD | Each machine | (the original) |
+| 2 | Borg | External disk on the home server | Home | Disk failure, deletion, ransomware on a client |
+| 3 | rclone cloud copies | Google Drive, iCloud Drive, OneDrive | Off site | Loss of the house, the server, or both |
+| (+) | Time Machine | External SSD on the home server | Home | Full-system loss of the laptop |
 
-Each tier compensates for a weakness in the others.
-Git does not capture large binary files well; cloud
-sync does not preserve commit history; Time Machine
-does not push data off-site; GitHub holds only one
-copy of the data it hosts. Together, the four
-components cover the full risk surface.
+Each mechanism answers a different question. Borg answers "what did
+this machine look like last Tuesday?" for every machine, with strong
+encryption and cheap history. The cloud copies answer "is there a copy
+of the projects somewhere other than this house?" Time Machine answers
+"how fast can the laptop be rebuilt exactly as it was?"
 
-# Section 1: The Three-Tier Ongoing Backup System
+The tiers are deliberately unequal in scope. Borg covers the
+irreplaceable parts of every home directory, including secrets. The
+cloud copies cover only the project tree, because that is the material
+whose loss would be most costly and whose content is least sensitive.
+Time Machine covers one machine, completely, minus data that is
+regenerable or held elsewhere.
 
-## Configuring Time Machine
+# Prerequisites
 
-Time Machine provides system-wide backup protection
-and serves as the safety net for everything beyond
-Git repositories.
+- Borg 1.4 on every client and on the server (`brew install
+  borgbackup` on macOS; the distribution package or the standalone
+  binary on Linux).
+- rclone 1.70 or later and `flock` (`brew install rclone flock`) on
+  the machines that run cloud copies, with an rclone remote configured
+  for each provider.
+- A password manager that every client can read. This fleet uses
+  `pass`; see [Setting Up pass](../sec-pass-password-manager/).
+- A home server reachable at a stable address. This fleet uses
+  Tailscale addresses for all scripted traffic; see [A Home Server for
+  a Five-Machine Research Fleet](../sec-five-machine-storage/) for the
+  server itself.
+- Full-disk encryption on every machine, so that the plaintext source
+  of each backup is itself protected at rest.
 
-### Connect and Format the USB Drive
+# Tier 1: Borg to the Home Server
 
-1. Connect your USB drive to the MacBook.
-2. When prompted, do not use it for Time Machine yet;
-   configure it properly first.
-3. Open Disk Utility (Applications > Utilities > Disk
-   Utility).
-4. Select the USB drive from the sidebar.
-5. Click Erase.
-6. Choose format: APFS (recommended for modern Macs)
-   or Mac OS Extended (Journaled).
-7. Name it something recognisable, such as 'Research
-   Backup'.
-8. Click Erase.
+## Design
 
-### Configure Time Machine
+Each client writes to its own Borg repository on the home server:
+`/srv/backup/julia`, `/srv/backup/athena`, and so on. The home server
+in turn backs up its own home directory and the folders it serves to a
+repository on julia, so the server is never the only place its own
+data lives.
 
-1. Open System Preferences > Time Machine.
-2. Click Select Backup Disk.
-3. Choose your USB drive.
-4. Click Use Disk.
-5. If prompted about encryption, choose Encrypt Backup
-   for security.
+Three properties make this tier robust against a compromised client:
 
-### Customize Exclusions
+1. **Encryption with a per-repository passphrase.** Each repository
+   uses Borg's `repokey` mode with its own passphrase. Every
+   passphrase is stored in `pass`. The machine that physically holds a
+   repository never holds its passphrase: the home server stores four
+   clients' archives and can decrypt none of them, and julia holds the
+   server's archive the same way.
+2. **A restricted, append-only key per client.** Each client pushes
+   with a dedicated SSH key that is good for nothing else. On the
+   server, that key is pinned to a forced command:
 
-1. Click Options in Time Machine preferences.
-2. Add folders to exclude: Downloads, Trash, virtual
-   machines, and similar high-churn directories.
-3. Do not exclude `~/prj` -- that directory should be
-   covered as a secondary layer behind Git.
-4. Enable 'Back up while on battery power' if you work
-   unplugged frequently.
+   ```text
+   command="/usr/local/bin/borg serve --append-only \
+     --restrict-to-repository /srv/backup/julia",restrict ssh-ed25519 \
+     AAAA... borg-julia
+   ```
 
-Time Machine will now back up the entire system
-(including `~/prj`) every hour when the USB drive is
-connected.
+   (Wrapped here for width; in `authorized_keys` it is one line.)
+   The `restrict` option disables port forwarding, agent forwarding,
+   and terminal allocation. `--restrict-to-repository` confines the
+   key to one repository. `--append-only` means the key can add
+   archives but cannot remove data already written. A thief or a piece
+   of ransomware holding a client can write garbage into that client's
+   repository; it cannot delete last month's archives.
+3. **A separate SSH configuration for the backup.** This one is easy
+   to get wrong. A typical `~/.ssh/config` already has an entry for the
+   server with a general-purpose key. SSH offers keys from the config
+   entry first, and `IdentityFile` is cumulative, so passing `-i` or
+   `-o IdentityFile=` on the command line does not displace the general
+   key. If the general key is accepted, the forced command never
+   applies and the backup runs with full shell rights. The backup
+   script therefore points Borg at its own configuration file:
 
-## The Minimal Backup Script
+   ```text
+   # ~/.borg/ssh_config (used only through BORG_RSH -F)
+   Host mercury
+     HostName <tailscale-address>
+     User <user>
+     IdentityFile ~/.ssh/id_ed25519_borg_julia
+     IdentitiesOnly yes
+     UserKnownHostsFile ~/.ssh/known_hosts
+     StrictHostKeyChecking yes
+     BatchMode yes
+   ```
 
-Before building the full production script, it helps
-to see the core logic in its simplest form. This
-minimal version does three things: finds every Git
-repository under `~/prj`, checks whether it has
-uncommitted changes, and pushes those changes to the
-remote.
+   `BatchMode yes` makes an unexpected prompt fail immediately rather
+   than hang a scheduled run. The consequence of a second configuration
+   file is that the server's address now lives in two places on each
+   machine, a point that mattered later (see [What broke, and how it was
+   found](#what-broke)).
 
-```bash
-#!/usr/bin/env bash
+## The backup script
 
-find "$HOME/prj" -name ".git" -type d \
-    | while read git_dir; do
-    cd "$(dirname "$git_dir")" || continue
-    [[ -n $(git status --porcelain) ]] || continue
-    git add -A
-    git commit -m \
-        "Auto-backup: $(date '+%Y-%m-%d %H:%M:%S')"
-    git push origin main 2>/dev/null \
-        || git push origin master 2>/dev/null
-done
-```
-
-The commit message here is a plain timestamp, not the
-imperative-mood style used for hand-written commits
-elsewhere on this site. That is deliberate: an unattended
-script has no "what changed and why" to report, so a
-timestamp is the more honest message. Do not use this
-style for a commit you write by hand.
-
-This works, but it lacks error handling, logging,
-user filtering, and any mechanism for diagnosing
-failures. The full script below addresses each of
-these gaps.
-
-## The Full Backup Script
-
-The production script extends the minimal version
-with comprehensive features. The sections below walk
-through it in logical segments.
-
-### Configuration and Argument Parsing
+One script, identical on all five machines, is driven entirely by
+files in `~/.borg/`: the repository URL, the passphrase (mode 600),
+an include list, and an exclude list. The essential lines:
 
 ```bash
-#!/usr/bin/env bash
+REPO=$(head -1 "$CONF/repo")
+BORG_PASSPHRASE=$(cat "$CONF/passphrase")
+export BORG_PASSPHRASE
+export BORG_RSH="ssh -F $CONF/ssh_config -o ConnectTimeout=30"
+# A differing URL makes borg ask an interactive question, which
+# under a timer means a silent abort.
+export BORG_RELOCATED_REPO_ACCESS_IS_OK=no
 
-RESEARCH_DIR="$HOME/prj/"
-LOG_FILE="$HOME/Library/Logs/research_backup.log"
-MAX_LOG_SIZE=10485760
-VERBOSE=false
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -v|--verbose)
-            VERBOSE=true
-            shift
-            ;;
-        -h|--help)
-            echo "Usage: $0 [-v|--verbose]" \
-                 "[-h|--help]"
-            echo "  -v, --verbose" \
-                 "Enable verbose output"
-            echo "  -h, --help" \
-                 "Show this help message"
-            exit 0
-            ;;
-        *)
-            echo "Unknown option: $1"
-            echo "Use -h or --help for usage"
-            exit 1
-            ;;
-    esac
-done
+"$BORG" create \
+  --stats --show-rc \
+  --compression zstd,3 \
+  --lock-wait 600 \
+  --exclude-from "$CONF/exclude" \
+  "$REPO::{hostname}-{now:%Y%m%d-%H%M%S}" \
+  "${PATHS[@]}"
 ```
 
-### Logging Infrastructure
+Three further details earn their place:
 
-Log rotation prevents the log file from growing
-without bound. The `log_message` function writes
-every event to disk and optionally echoes
-color-coded output to the console when verbose mode
-is active.
+- **Missing include paths are logged, not fatal.** Each path in the
+  include list is checked first. A path that does not exist, or that
+  exists but cannot be listed, is skipped with a `WARNING` line. This
+  keeps one stale entry from preventing the whole archive, but it
+  creates its own risk: a partial archive still finishes with
+  success. The first incident below is exactly this.
+- **A watchdog.** A background timer kills the run after four hours.
+  The failure that motivated it was Borg blocked on a cloud
+  file-provider read for over half an hour at nearly zero CPU, holding
+  the repository lock and wedging every later run.
+- **No pruning from the client.** Under `--append-only`, a prune from
+  the client only marks archives as deleted; space cannot be reclaimed.
+  Retention runs on the server instead (below).
+
+The script logs every run to `~/.borg/log/backup-<timestamp>.log`,
+ending with a single line `=== exit N`. Borg's exit codes are
+meaningful: 0 is success, 1 is success with warnings (a file changed
+while being read; the archive is valid), 2 is an error. The script
+adds 3 for local misconfiguration.
+
+## What is included
+
+The include list names directories explicitly rather than archiving
+the whole home directory: the project tree (`~/prj`), documents
+(`~/docs`), the dotfiles repository, and the secrets that exist
+nowhere else: `.gnupg`, `.password-store`, `.aws`, `.Renviron`, and
+`.env` files. The Linux laptop archives its whole home directory with
+excludes. Caches, package libraries (`renv/library`, `node_modules`,
+virtual environments), and build artifacts are excluded everywhere. So
+is the scratch folder (`~/compute`) that the two simulation hosts use
+for job runs: everything in it can be regenerated from a commit and the
+project's data, and finished results are fetched back to the
+workstation that submitted the job, where the ordinary include list
+covers them. See [Offloading R Simulations to a Home
+Server](../zc-offload-simulations-home-server/).
+
+Including `.gnupg` and `.password-store` may look redundant, since the
+same key and vault exist on several machines and the vault has its own
+git history. The reason is that replication is not backup: an
+accidental deletion in the vault propagates to every machine at the
+next sync. A dated Borg archive is the copy that predates the mistake.
+
+## Scheduling
+
+On the Macs a launchd user agent runs the script at a fixed time each
+night (02:00 on julia, staggered on the others so the server is not
+contended). On the Linux machines a systemd user timer does the same.
+Both hand the script a minimal `PATH`, which is why it locates the
+`borg` binary itself rather than trusting the login shell.
+
+A Mac that is asleep at 02:00 runs the job at its next wake. If that
+wake is a brief maintenance wake on battery, the network may not be up
+yet, and the run fails on a connection timeout. A backup script should
+wait for, or retry, connectivity before declaring failure.
+
+## Retention
+
+Without pruning, every repository grows without limit. The retention
+policy is:
 
 ```bash
-mkdir -p "$(dirname "$LOG_FILE")"
-
-if [[ -f "$LOG_FILE" \
-      && $(stat -f%z "$LOG_FILE") \
-         -gt $MAX_LOG_SIZE ]]; then
-    mv "$LOG_FILE" "${LOG_FILE}.old"
-    if [[ "$VERBOSE" == true ]]; then
-        echo "INFO: Rotated log file" \
-             "(exceeded ${MAX_LOG_SIZE} bytes)"
-    fi
-fi
-
-log_message() {
-    local level="$1"
-    local message="$2"
-    local timestamp
-    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    local log_entry
-    log_entry="$timestamp: [$level] $message"
-
-    echo "$log_entry" >> "$LOG_FILE"
-
-    if [[ "$VERBOSE" == true ]]; then
-        case "$level" in
-            ERROR)
-                echo -e \
-                    "\033[31m$log_entry\033[0m"
-                ;;
-            WARNING)
-                echo -e \
-                    "\033[33m$log_entry\033[0m"
-                ;;
-            SUCCESS)
-                echo -e \
-                    "\033[32m$log_entry\033[0m"
-                ;;
-            INFO)
-                echo -e \
-                    "\033[34m$log_entry\033[0m"
-                ;;
-            *)
-                echo "$log_entry"
-                ;;
-        esac
-    fi
-}
+borg prune --keep-daily 14 --keep-weekly 8 \
+  --keep-monthly 12 --keep-yearly 3 "$REPO"
+borg compact "$REPO"
 ```
 
-### Repository Validation Functions
+Fourteen daily archives, eight weekly, twelve monthly, and three
+yearly: roughly two weeks of fine-grained history, a year of monthly
+checkpoints, and a few years of annual ones.
 
-Four helper functions handle the filtering logic.
-`check_remote` verifies that the repository has an
-`origin` remote. `check_user_association` ensures
-that only repositories belonging to the 'rgt47'
-account are processed, preventing the script from
-pushing to collaborator remotes.
-`should_exclude_directory` skips archive and backup
-folders. `get_current_branch` and
-`branch_exists_on_remote` support intelligent push
-behavior.
-
-```bash
-check_remote() {
-    local repo_dir="$1"
-    cd "$repo_dir" || return 1
-    local remote_url
-    remote_url=$(git remote get-url origin \
-        2>/dev/null)
-    [[ -n "$remote_url" ]]
-}
-
-check_user_association() {
-    local repo_dir="$1"
-    cd "$repo_dir" || return 1
-
-    local remote_url
-    remote_url=$(git remote get-url origin \
-        2>/dev/null)
-    if [[ "$remote_url" == *"rgt47"* ]]; then
-        return 0
-    fi
-
-    local git_user git_email
-    git_user=$(git config user.name 2>/dev/null)
-    git_email=$(git config user.email 2>/dev/null)
-
-    if [[ "$git_user" == *"rgt47"* ]] \
-       || [[ "$git_email" == *"rgt47"* ]]; then
-        return 0
-    fi
-
-    if [[ -z "$git_user" ]]; then
-        git_user=$(git config --global \
-            user.name 2>/dev/null)
-    fi
-    if [[ -z "$git_email" ]]; then
-        git_email=$(git config --global \
-            user.email 2>/dev/null)
-    fi
-
-    if [[ "$git_user" == *"rgt47"* ]] \
-       || [[ "$git_email" == *"rgt47"* ]]; then
-        return 0
-    fi
-
-    return 1
-}
-
-should_exclude_directory() {
-    local repo_name="$1"
-    local repo_path="$2"
-
-    local lower_name lower_path
-    lower_name=$(echo "$repo_name" \
-        | tr '[:upper:]' '[:lower:]')
-    lower_path=$(echo "$repo_path" \
-        | tr '[:upper:]' '[:lower:]')
-
-    if [[ "$lower_name" == *"archive"* ]] \
-       || [[ "$lower_name" == *"backup"* ]]; then
-        return 0
-    fi
-
-    if [[ "$lower_path" == *"archive"* ]] \
-       || [[ "$lower_path" == *"backup"* ]]; then
-        return 0
-    fi
-
-    return 1
-}
-
-get_current_branch() {
-    git symbolic-ref --short HEAD 2>/dev/null \
-        || git rev-parse --short HEAD 2>/dev/null
-}
-
-branch_exists_on_remote() {
-    local branch="$1"
-    git ls-remote --heads origin "$branch" \
-        2>/dev/null | grep -q "$branch"
-}
-```
-
-### Main Loop: Discovery and Processing
-
-The main loop uses `find` with null-delimited output
-to safely handle repository paths that contain
-spaces. Each repository passes through a series of
-checks before any Git operations are attempted.
-
-```bash
-log_message "INFO" \
-    "Starting research backup scan" \
-    " with verbose=$VERBOSE"
-
-if [[ ! -d "$RESEARCH_DIR" ]]; then
-    log_message "ERROR" \
-        "Research directory $RESEARCH_DIR" \
-        " does not exist"
-    exit 1
-fi
-
-log_message "INFO" \
-    "Scanning: $RESEARCH_DIR"
-
-repo_count=0
-backup_count=0
-error_count=0
-warning_count=0
-skipped_count=0
-excluded_count=0
-
-while IFS= read -r -d '' git_dir; do
-    repo_dir=$(dirname "$git_dir")
-    repo_name=$(basename "$repo_dir")
-    relative_path="${repo_dir#$RESEARCH_DIR}"
-
-    if should_exclude_directory \
-       "$repo_name" "$relative_path"; then
-        log_message "INFO" \
-            "Excluding (archive/backup):" \
-            " $relative_path"
-        ((excluded_count++))
-        continue
-    fi
-
-    log_message "INFO" \
-        "Processing: $relative_path"
-
-    if ! cd "$repo_dir"; then
-        log_message "ERROR" \
-            "Cannot access: $repo_dir"
-        ((error_count++))
-        continue
-    fi
-
-    ((repo_count++))
-
-    if ! git rev-parse --git-dir \
-         >/dev/null 2>&1; then
-        log_message "ERROR" \
-            "Not a valid git repo:" \
-            " $relative_path"
-        ((error_count++))
-        continue
-    fi
-
-    if ! check_user_association "$repo_dir"; then
-        log_message "INFO" \
-            "Skipping (not rgt47):" \
-            " $relative_path"
-        ((skipped_count++))
-        continue
-    fi
-
-    log_message "INFO" \
-        "$relative_path associated with rgt47"
-
-    if ! check_remote "$repo_dir"; then
-        log_message "WARNING" \
-            "No remote configured:" \
-            " $relative_path"
-        ((warning_count++))
-        ((skipped_count++))
-        continue
-    fi
-
-    current_branch=$(get_current_branch)
-    if [[ -z "$current_branch" ]]; then
-        log_message "ERROR" \
-            "Cannot determine branch:" \
-            " $relative_path"
-        ((error_count++))
-        continue
-    fi
-
-    log_message "INFO" \
-        "$relative_path on branch:" \
-        " $current_branch"
-
-    git_status=$(git status --porcelain \
-        2>/dev/null)
-
-    if [[ -z "$git_status" ]]; then
-        log_message "INFO" \
-            "$relative_path is clean"
-        continue
-    fi
-
-    untracked=$(echo "$git_status" \
-        | grep -c "^??" || echo 0)
-    modified=$(echo "$git_status" \
-        | grep -c "^ M" || echo 0)
-    added=$(echo "$git_status" \
-        | grep -c "^A " || echo 0)
-    deleted=$(echo "$git_status" \
-        | grep -c "^D " || echo 0)
-
-    log_message "INFO" \
-        "$relative_path: $untracked new," \
-        " $modified modified, $added added," \
-        " $deleted deleted"
-
-    if ! git add -A 2>/dev/null; then
-        log_message "ERROR" \
-            "Failed to stage: $relative_path"
-        ((error_count++))
-        continue
-    fi
-
-    log_message "INFO" \
-        "Staged changes: $relative_path"
-
-    commit_message="Auto-backup:" \
-        " $(date '+%Y-%m-%d %H:%M:%S')"
-
-    if git commit -m "$commit_message" \
-       >/dev/null 2>&1; then
-        log_message "SUCCESS" \
-            "Committed: $relative_path"
-
-        if ! branch_exists_on_remote \
-             "$current_branch"; then
-            log_message "WARNING" \
-                "'$current_branch' not on" \
-                " remote: $relative_path"
-
-            if git push --set-upstream origin \
-               "$current_branch" 2>/dev/null
-            then
-                log_message "SUCCESS" \
-                    "Created and pushed" \
-                    " '$current_branch':" \
-                    " $relative_path"
-                ((backup_count++))
-            else
-                log_message "ERROR" \
-                    "Failed to push new" \
-                    " branch: $relative_path"
-                ((error_count++))
-            fi
-        else
-            if git push origin \
-               "$current_branch" 2>/dev/null
-            then
-                log_message "SUCCESS" \
-                    "Pushed '$current_branch':" \
-                    " $relative_path"
-                ((backup_count++))
-            else
-                log_message "ERROR" \
-                    "Push failed:" \
-                    " $relative_path" \
-                    " (check network/auth)"
-                ((error_count++))
-            fi
-        fi
-    else
-        if git diff --cached --quiet; then
-            log_message "INFO" \
-                "No changes to commit:" \
-                " $relative_path"
-        else
-            log_message "ERROR" \
-                "Commit failed:" \
-                " $relative_path"
-            ((error_count++))
-        fi
-    fi
-
-done < <(find "$RESEARCH_DIR" \
-    -name ".git" -type d -print0)
-```
-
-### Summary Report
-
-After processing every repository, the script logs
-aggregate statistics and, in verbose mode, prints a
-human-readable summary to the console.
-
-```bash
-log_message "INFO" "Backup scan complete"
-log_message "INFO" \
-    "Summary: $repo_count processed," \
-    " $backup_count backed up"
-log_message "INFO" \
-    "Excluded: $excluded_count," \
-    " Skipped: $skipped_count," \
-    " Errors: $error_count," \
-    " Warnings: $warning_count"
-
-if [[ "$VERBOSE" == true ]]; then
-    echo ""
-    echo "=== BACKUP SUMMARY ==="
-    echo "Repositories found:" \
-         "$((repo_count + excluded_count" \
-         " + skipped_count))"
-    echo "Excluded: $excluded_count" \
-         "(archive/backup)"
-    echo "Skipped: $skipped_count (not rgt47)"
-    echo "Processed: $repo_count"
-    echo "Backed up: $backup_count"
-    echo "Errors: $error_count"
-    echo "Warnings: $warning_count"
-    echo ""
-    echo "Log file: $LOG_FILE"
-
-    if [[ $error_count -gt 0 ]]; then
-        echo ""
-        echo "WARNING: There were errors" \
-             "during backup. Check the log" \
-             "file for details."
-        exit 1
-    elif [[ $warning_count -gt 0 ]]; then
-        echo ""
-        echo "NOTE: Backup completed with" \
-             "warnings. Check the log file" \
-             "for details."
-    else
-        echo ""
-        echo "Backup completed successfully."
-    fi
-fi
-
-exit 0
-```
-
-## Scheduling with Cron
-
-The final step is to make the script run
-automatically. A cron job at 15-minute intervals
-provides a good balance between backup frequency and
-system resource usage.
-
-```bash
-crontab -e
-```
-
-Add the following entry:
-
-```bash
-*/15 * * * * /Users/$(whoami)/scripts/backup-research.sh
-```
-
-Save and exit (`Ctrl+X`, then `Y`, then `Enter` in
-nano; or `Esc`, `:wq`, `Enter` in vim). Verify:
-
-```bash
-crontab -l
-```
-
-Wait 15 minutes, then confirm execution by inspecting
-the log:
-
-```bash
-tail -20 ~/Library/Logs/research_backup.log
-```
+The policy runs **manually, once a quarter**, on the machine that
+holds each repository, not over the append-only path. This is a
+deliberate trade. Automating the prune would require each
+repository's passphrase in a file on the storage host, which gives up
+the property that the server cannot decrypt what it stores. A small
+script, `borg-prune`, makes the manual step cheap and safe: it prompts
+for the passphrase (read from `pass` on a machine that already holds
+it), lists the archives, shows a dry run of what the policy would
+delete, requires typing `YES`, and only then prunes and compacts. The
+pass over all five repositories is a standing item in the quarterly
+audit described in the [series overview](../sec-multi-laptop-threat-model/).
 
 ![A single external hard drive resting on a desk beside a coiled
 cable and a small paper luggage
 tag.](media/images/ambiance2.jpg){.img-fluid height=3.5in}
 
-# Section 2: Bulk GitHub Account Archival
+# Tier 2: Cloud Copies with rclone
 
-The ongoing backup system protects daily work, but it
-does not address the accumulation of private
-repositories that exist only on GitHub. A GitHub
-archive, in this context, is a local copy of
-everything GitHub stores for a repository: not just
-the code and commit history, but also the metadata
-that lives only on GitHub's servers (issue threads,
-pull request discussions, release binaries, labels,
-milestones, and wiki pages).
+## Design
 
-A regular `git clone` captures the commit graph but
-misses all of that surrounding context. A mirror
-clone (`git clone --mirror`) captures every ref,
-including remote-tracking branches and tags. A git
-bundle packages that mirror into a single portable
-file. And the GitHub API exports capture the metadata
-that git itself does not track.
+The two machines where most project work happens, julia and athena,
+each mirror `~/prj` nightly to Google Drive, iCloud Drive, and a
+personal OneDrive account. joe and zeus have no cloud job; Borg covers
+them, and three copies of two machines' projects are enough off-site
+redundancy.
 
-The archival script combines all three approaches:
-mirror clone for completeness, bundle for
-portability, and API exports for metadata. The result
-is a self-contained backup directory per repository
-that can survive even if GitHub itself becomes
-unavailable.
+Two decisions shape this tier:
 
-## The Three-Phase Approach
+- **One destination per machine.** Each machine syncs to its own
+  folder, for example `backup/prj-julia` and `backup/prj-athena`.
+  `rclone sync` makes the destination an exact mirror of the source,
+  including deletions. When two machines mirrored their own slightly
+  different copies of `~/prj` to the same folder, each run undid the
+  other's, and neither copy was ever complete.
+- **Deleted files are kept, by date.** `--backup-dir` moves anything
+  the sync would delete or overwrite into a dated folder beside the
+  mirror, so a file removed by mistake on Monday is still recoverable
+  from the cloud on Friday.
 
-The archive script follows a strict three-phase
-process. Understanding this structure makes the full
-script easier to follow.
+## The wrapper
 
-**Phase 1: Backup Everything.** For each repository,
-the script creates:
-
-- A full git mirror with every branch and tag
-- A portable bundle file for easy transfer
-- Wiki content (if the repo has one)
-- Metadata exports via the GitHub API (issues, PRs,
-  releases, labels, milestones, workflows)
-- Downloaded release assets (binaries, artifacts)
-
-**Phase 2: Verify Backups.** Before any deletion, the
-script runs `git bundle verify` on every bundle. If
-any verification fails, the entire deletion phase is
-aborted. This step is essential: without it, the
-deletion phase cannot be trusted.
-
-**Phase 3: Selective Deletion.** Only repos not in the
-keep-list get deleted, and only after an explicit
-typed confirmation (`DELETE`). Repos in
-`KEEP_ON_GITHUB` are still backed up but are not
-removed from GitHub.
-
-## The Complete Working Script
-
-Save the full script as `github-archive.sh` and make
-it executable with `chmod +x github-archive.sh`.
-
-### Script Header and Configuration
+All three targets go through one wrapper script, `backup-remote`, with
+a thin entry point per provider for launchd to call:
 
 ```bash
-#!/usr/bin/env bash
+case "$target" in
+  gdrive)
+    dest="gdrive:backup/prj-$HOST"
+    deleted="gdrive:backup/prj-${HOST}_deleted"
+    lock=/tmp/rclone_gdrive.lock ;;
+  # icloud and onedrive follow the same pattern
+esac
 
-set -e
+# -E 75: a held lock means an earlier run is still going. Without it
+# flock exits 1 silently, and a skipped night looks like a failure.
+rc=0
+/opt/homebrew/bin/flock -n -E 75 "$lock" \
+  /opt/homebrew/bin/rclone sync -L "$PRJ_ROOT" "$dest" \
+  --backup-dir "$deleted/$(date +%Y-%m-%d)" \
+  --exclude "**/.cache/**" \
+  --exclude "**/node_modules/**" \
+  --exclude "**/.venv/**" \
+  --exclude "**/renv/library/**" \
+  "$@" || rc=$?
 
-OWNER="your-username"
-BACKUP_DIR="$HOME/github-archive"
-DATE=$(date +%Y%m%d)
-LOG_FILE="$BACKUP_DIR/archive_$DATE.log"
-DRY_RUN=false
-
-KEEP_ON_GITHUB=(
-    "important-project"
-    "active-work"
-    "shared-with-team"
-)
-
-usage() {
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo "Options:"
-    echo "  -n, --dry-run     Show what would happen"
-    echo "  -o, --owner NAME  GitHub username/org"
-    echo "  -d, --dir PATH    Backup directory"
-    echo "  -h, --help        Show this help message"
-    exit 0
-}
-
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -n|--dry-run)
-            DRY_RUN=true
-            shift
-            ;;
-        -o|--owner)
-            OWNER="$2"
-            shift 2
-            ;;
-        -d|--dir)
-            BACKUP_DIR="$2"
-            shift 2
-            ;;
-        -h|--help)
-            usage
-            ;;
-        *)
-            echo "Unknown option: $1"
-            usage
-            ;;
-    esac
-done
-
-mkdir -p "$BACKUP_DIR"
-```
-
-The `KEEP_ON_GITHUB` array is the most important
-configuration. Reviewing the repository list before
-running the script ensures the right ones are
-included.
-
-### Utility Functions
-
-```bash
-log() {
-    local prefix=""
-    if [ "$DRY_RUN" = true ]; then
-        prefix="[DRY-RUN] "
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] \
-${prefix}$1" | tee -a "$LOG_FILE"
-}
-
-is_kept() {
-    local repo=$1
-    for kept in "${KEEP_ON_GITHUB[@]}"; do
-        if [ "$repo" = "$kept" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
-```
-
-### Phase 1: The Backup Function
-
-```bash
-backup_repo() {
-    local repo=$1
-    local repo_dir="$BACKUP_DIR/$repo"
-
-    log "=== Backing up $repo ==="
-
-    if [ "$DRY_RUN" = true ]; then
-        log "Would create: $repo_dir"
-        log "Would clone: $OWNER/$repo"
-        log "Would export: issues, PRs, releases"
-        return
-    fi
-
-    mkdir -p "$repo_dir"
-    cd "$repo_dir"
-
-    if [ ! -d "repo.git" ]; then
-        log "Cloning repository..."
-        gh repo clone "$OWNER/$repo" \
-            repo.git -- --mirror
-    else
-        log "Updating existing clone..."
-        cd repo.git && git fetch --all && cd ..
-    fi
-
-    log "Creating git bundle..."
-    cd repo.git
-    git bundle create ../repo.bundle --all
-    cd ..
-
-    log "Checking for wiki..."
-    if gh api "repos/$OWNER/$repo" \
-        --jq '.has_wiki' 2>/dev/null \
-        | grep -q true; then
-        git clone \
-            "https://github.com/$OWNER/$repo.wiki.git" \
-            wiki.git 2>/dev/null \
-            || log "No wiki content"
-    fi
-
-    log "Exporting metadata..."
-    gh api "repos/$OWNER/$repo" \
-        > repo-info.json 2>/dev/null || true
-    gh api "repos/$OWNER/$repo/issues?state=all" \
-        --paginate > issues.json 2>/dev/null || true
-    gh api "repos/$OWNER/$repo/pulls?state=all" \
-        --paginate \
-        > pull-requests.json 2>/dev/null || true
-    gh api "repos/$OWNER/$repo/releases" \
-        --paginate > releases.json 2>/dev/null || true
-    gh api "repos/$OWNER/$repo/labels" \
-        --paginate > labels.json 2>/dev/null || true
-    gh api "repos/$OWNER/$repo/milestones?state=all" \
-        --paginate \
-        > milestones.json 2>/dev/null || true
-
-    if [ -s releases.json ] \
-        && [ "$(cat releases.json)" != "[]" ]; then
-        log "Downloading release assets..."
-        mkdir -p release-assets
-        gh release list -R "$OWNER/$repo" \
-            --limit 100 2>/dev/null \
-            | while read -r tag rest; do
-            gh release download "$tag" \
-                -R "$OWNER/$repo" \
-                -D "release-assets/$tag" \
-                2>/dev/null || true
-        done
-    fi
-
-    log "Completed backup of $repo"
-    cd "$BACKUP_DIR"
-}
-```
-
-The `--paginate` flag on `gh api` calls is essential.
-Without it, GitHub's API returns only the first 30
-items per endpoint, which means issues and PRs on
-larger repos are silently lost.
-
-### Phase 2: The Verification Function
-
-```bash
-verify_backup() {
-    local repo=$1
-    local repo_dir="$BACKUP_DIR/$repo"
-
-    log "Verifying backup of $repo..."
-
-    if [ "$DRY_RUN" = true ]; then
-        log "Would verify: $repo_dir/repo.bundle"
-        return 0
-    fi
-
-    if [ -f "$repo_dir/repo.bundle" ]; then
-        cd "$repo_dir"
-        if git bundle verify repo.bundle \
-            > /dev/null 2>&1; then
-            log "PASS: Bundle verified"
-            return 0
-        else
-            log "FAIL: Bundle verification failed!"
-            return 1
-        fi
-    else
-        log "FAIL: Bundle not found!"
-        return 1
-    fi
-}
-```
-
-### Phase 3: The Deletion Function
-
-```bash
-delete_repo() {
-    local repo=$1
-
-    if [ "$DRY_RUN" = true ]; then
-        log "Would delete: $OWNER/$repo"
-        return
-    fi
-
-    log "Deleting $repo from GitHub..."
-    gh repo delete "$OWNER/$repo" --yes
-    log "Deleted $repo"
-}
-```
-
-### Main Execution Flow
-
-```bash
-if [ "$DRY_RUN" = true ]; then
-    echo "======================================="
-    echo " DRY-RUN MODE - No changes will be made"
-    echo "======================================="
-    echo ""
+if [ "$rc" -eq 75 ]; then
+  echo "$(date '+%Y/%m/%d %H:%M:%S') backup-remote: $target run" \
+    "skipped: an earlier run still holds $lock" >&2
 fi
-
-log "Starting GitHub archive process"
-log "Owner: $OWNER"
-log "Backup directory: $BACKUP_DIR"
-
-log "Fetching list of private repositories..."
-repos=$(gh repo list "$OWNER" \
-    --limit 500 --private \
-    --json name -q '.[].name')
-repo_count=$(echo "$repos" | wc -l | tr -d ' ')
-log "Found $repo_count private repositories"
-
-repos_to_delete=""
-repos_to_keep=""
-delete_count=0
-keep_count=0
-
-for repo in $repos; do
-    if is_kept "$repo"; then
-        repos_to_keep="$repos_to_keep $repo"
-        ((keep_count++)) || true
-    else
-        repos_to_delete="$repos_to_delete $repo"
-        ((delete_count++)) || true
-    fi
-done
-
-log "Repos to archive and DELETE: $delete_count"
-log "Repos to archive and KEEP: $keep_count"
-
-echo ""
-echo "=== REPO CATEGORIZATION ==="
-echo ""
-echo "Will be DELETED after backup ($delete_count):"
-for repo in $repos_to_delete; do
-    echo "  x $repo"
-done
-echo ""
-echo "Will be KEPT on GitHub ($keep_count):"
-for repo in $repos_to_keep; do
-    echo "  + $repo"
-done
-echo ""
-
-if [ "$DRY_RUN" = true ]; then
-    echo "=== DRY-RUN: PHASE 1 (BACKUP) ==="
-    for repo in $repos; do
-        backup_repo "$repo"
-    done
-
-    echo ""
-    echo "=== DRY-RUN: PHASE 2 (VERIFICATION) ==="
-    for repo in $repos; do
-        verify_backup "$repo"
-    done
-
-    echo ""
-    echo "=== DRY-RUN: PHASE 3 (DELETION) ==="
-    for repo in $repos_to_delete; do
-        delete_repo "$repo"
-    done
-
-    echo ""
-    echo "======================================="
-    echo "   DRY-RUN COMPLETE"
-    echo "======================================="
-    echo ""
-    echo "Run without --dry-run to execute."
-    exit 0
-fi
-
-log "=== PHASE 1: BACKUP ==="
-for repo in $repos; do
-    backup_repo "$repo"
-done
-
-log "=== PHASE 2: VERIFICATION ==="
-failed_repos=""
-for repo in $repos; do
-    if ! verify_backup "$repo"; then
-        failed_repos="$failed_repos $repo"
-    fi
-done
-
-if [ -n "$failed_repos" ]; then
-    log "WARNING: Verification failed:$failed_repos"
-    log "Aborting deletion phase"
-    exit 1
-fi
-
-log "All backups verified successfully!"
-
-log "=== PHASE 3: DELETION ==="
-echo ""
-echo "Backup complete and verified!"
-echo ""
-read -p "Delete $delete_count repos? \
-(type 'DELETE'): " confirm
-
-if [ "$confirm" = "DELETE" ]; then
-    for repo in $repos_to_delete; do
-        delete_repo "$repo"
-    done
-    log "Deleted $delete_count repositories"
-else
-    log "Deletion cancelled"
-fi
-
-log "Archive process complete"
+exit "$rc"
 ```
 
-## Using the Archival Script
+The lock prevents two runs to the same destination from overlapping,
+which matters because the first upload to a provider can take many
+hours. The exit code 75 (`EX_TEMPFAIL`) makes a skipped run visible
+in `launchctl list` and leaves a dated line in the log.
+
+## Two hazards of `rclone sync`
+
+**Cache directories.** The excludes are not an optimization. One
+night's Google Drive run went more than fifteen hours without
+finishing because it was uploading tens of thousands of small files
+from R package caches, which the provider deliberately throttles. The
+excludes now match the categories Borg already skips.
+
+**Symlinks and the deletion guard.** `-L` follows symbolic links, which
+the project tree uses for shortcuts between repositories. If rclone
+hits any listing error during a run, it skips **all deletions** for
+that run as a safety measure, and logs `not deleting files as there
+were IO errors`. A single broken or self-referencing link anywhere in
+`~/prj` therefore disables deletion permanently and silently: files
+removed or renamed locally are never removed from the mirror, which
+grows without bound. A student repository containing a link that
+pointed to itself did exactly this on every machine that held it. The
+remedy is to scan for such links before uninstalling or moving
+anything:
 
 ```bash
-./github-archive.sh --dry-run
-
-./github-archive.sh
-
-./github-archive.sh \
-    --owner myorg --dir /external/drive/backup
+# Links that loop or point nowhere, under the backed-up tree.
+find -L ~/prj -type l 2>/dev/null
 ```
 
-Running the dry-run first is not merely useful; it
-is essential. The categorization output can catch
-repos that were forgotten in the keep-list.
+`find -L` reports links it cannot resolve; it is cheap enough to run
+in the quarterly audit.
 
-Configure the `KEEP_ON_GITHUB` array to match your
-situation:
+# Tier 3: Time Machine
+
+Time Machine protects athena, the laptop, which is the machine most
+likely to be lost and the one where a full-system restore is most
+valuable. It backs up to a Samba share on the home server, on an
+external SSD. The server-side setup (the share, the disk, the
+firewall, and the binding problems that had to be solved) is
+described in [A Home Server for a Five-Machine Research
+Fleet](../sec-five-machine-storage/). This section covers policy.
+
+**Encryption is chosen once.** Time Machine encrypts a network backup
+only if *Encrypt Backup* is selected at the moment the destination is
+added. The first attempt in this fleet was added without it and had
+written 258 GB before the omission was noticed; the only remedy was to
+remove the destination, delete the backup from the share, and start
+again. Generate the encryption password in the password manager first
+(`pass generate`), then paste it into the dialog, so it exists
+somewhere other than the backup's own Keychain entry.
+
+**Exclusions follow the same logic as the other tiers.** Back up what
+cannot be regenerated or recovered from elsewhere; skip the rest.
+On athena that means excluding:
+
+- `~/Downloads` and caches;
+- Docker's data (images rebuild from `Dockerfile` and `renv.lock`);
+- large vendor installations that their installer can restore;
+- Messages attachments and previews, which Messages in iCloud already
+  holds;
+- the local copy of a server-held mail account;
+- the Spotlight index, which rebuilds itself;
+- the local copy of the cloud backup folder, which would otherwise be
+  backed up twice.
+
+`/Applications` and `/Library` stay in: with a minimal application set
+they are small, and they are what makes a restored system usable
+without reinstalling everything.
+
+Exclusions are applied with `tmutil`, scripted so they can be reviewed
+and re-applied:
 
 ```bash
-KEEP_ON_GITHUB=(
-    "active-projects"
-    "shared-with-team"
-    "client-work"
-    "portfolio"
-)
+sudo tmutil addexclusion -p "$HOME/Downloads"
+sudo tmutil addexclusion -p "$HOME/Library/Metadata/CoreSpotlight"
+# -p records a fixed path. Check the result with:
+defaults read /Library/Preferences/com.apple.TimeMachine SkipPaths
 ```
 
-## Backup Directory Structure
+One trap: `tmutil isexcluded` reports a path as excluded if any parent
+is excluded. Once a parent such as `/Library` is included again, a
+script that relied on `isexcluded` to decide "already handled" will
+skip children that now need their own exclusion. Check the
+`SkipPaths` list or the item's own exclusion attribute instead.
 
-After running the script, the backup directory looks
-like this:
+**Exclusions in a mail account folder are per account.** Excluding the
+whole Mail folder would have dropped a local "On My Mac" mailbox that
+held recovered messages existing nowhere else. Exclude only the folder
+of an account whose mail is held on its server.
 
-```
-~/github-archive/
-+-- important-project/      # KEPT on GitHub
-|   +-- repo.git/
-|   +-- repo.bundle
-|   +-- repo-info.json
-|
-+-- old-project-1/          # DELETED from GitHub
-|   +-- repo.git/
-|   +-- repo.bundle
-|   +-- wiki.git/
-|   +-- repo-info.json
-|   +-- issues.json
-|   +-- pull-requests.json
-|   +-- releases.json
-|   +-- labels.json
-|   +-- milestones.json
-|   +-- release-assets/
-|
-+-- archive_20260517.log
-```
+# Restore Testing
 
-| Content        | Format                | Use Case             |
-|----------------|-----------------------|----------------------|
-| Git history    | `repo.git/` + bundle  | Full reproducibility |
-| Wiki           | `wiki.git/`           | Documentation        |
-| Issues         | `issues.json`         | Discussion archive   |
-| Pull requests  | `pull-requests.json`  | Code review history  |
-| Releases       | `releases.json`       | Version history      |
-| Release assets | `release-assets/`     | Binaries, artifacts  |
-| Metadata       | `repo-info.json`      | Repository config    |
-| Labels         | `labels.json`         | Issue classification |
-| Milestones     | `milestones.json`     | Project tracking     |
-
-## Restoring from Archive
+A backup that has never been restored is a hypothesis. Each tier has a
+cheap test that belongs in the quarterly audit:
 
 ```bash
-git clone \
-    ~/github-archive/repo-name/repo.bundle \
-    restored-repo
-
-gh repo create new-repo-name --private
-cd ~/github-archive/repo-name/repo.git
-git push --mirror \
-    git@github.com:you/new-repo-name.git
+# Borg: list archives, verify repository consistency, and restore a
+# known file into a scratch directory.
+borg list "$REPO" | tail -3
+borg check --repository-only "$REPO"
+mkdir -p /tmp/restore-test && cd /tmp/restore-test
+borg extract "$REPO::julia-20261001-020000" Users/me/docs/notes.md
 ```
 
-The bundle approach is more convenient for quick
-local inspection; the mirror push is better for
-actually recreating a repository on GitHub.
+- **Borg.** Pick a file that changed recently, restore it from the
+  latest archive and from one a month old, and compare. Run
+  `borg check` on each repository at least quarterly; a full
+  `borg check --verify-data` reads every chunk and is worth an
+  occasional overnight run.
+- **Cloud copies.** Download a recently modified file from each
+  provider and compare its checksum with the local file. Restore one
+  file from a dated `_deleted` folder to confirm `--backup-dir` is
+  working.
+- **Time Machine.** Restore a file through the Time Machine browser.
+  Before trusting the share for a bare-metal restore, restore a whole
+  machine onto a spare disk once.
 
-# Section 3: Verification and Testing
+The archive name in the example is illustrative; use `borg list` to
+find a real one. Restores need the passphrase, so the test also
+confirms that the passphrase in `pass` still opens the repository.
 
-## Ongoing Backup Verification
+# Monitoring
 
-To confirm that the daily backup script is running
-correctly:
+There is no alerting in this fleet. The practice that replaces it is
+a short daily check of every job's last exit status and the freshness
+of its log, **on every machine, including the Linux ones**:
 
 ```bash
-tail -20 ~/Library/Logs/research_backup.log
+# macOS: the second column is the last exit status.
+launchctl list | grep -E 'borg|rclone'
 
-~/scripts/backup-research.sh --verbose
+# Linux: the result of the last timer run.
+systemctl --user show -p Result,ExecMainStatus borg-backup.service
+
+# Either: the newest Borg log and its final lines.
+f=$(ls -t ~/.borg/log/backup-*.log | head -1)
+echo "$f"; grep -E '^=== ' "$f" | tail -2
 ```
 
-Check that recent log entries show `[SUCCESS]` for
-pushed repositories and that the timestamp reflects
-the expected cron interval.
+A status of 0 everywhere and a log dated today is the whole check.
+Anything else gets read. The useful property of launchd's exit
+status column is that it already recorded every failure described
+below; nobody was looking at it. Automating this check, so that a
+non-zero status or a stale log produces a message, is the most
+valuable improvement left in the design.
 
-## GitHub Archive Verification
+![The UCSD Geisel Library at
+dusk.](media/images/ambiance3.jpg){.img-fluid height=3.5in}
 
-Before trusting any archival backup, run these checks:
+# What broke, and how it was found {#what-broke}
 
-```bash
-cd ~/github-archive/repo-name
-git bundle verify repo.bundle
+Every incident below was found by reading logs or exit statuses, most
+during the first [quarterly audit](../sec-fleet-hardening-lessons/).
+They are grouped by the lesson they teach.
 
-ls -la *.json
+## A partial backup looks like a successful one
 
-git bundle list-heads repo.bundle
+- **Coverage loss when a folder moved.** The Borg include lists on the
+  Macs reached `~/prj`, `~/docs`, and a shared utilities folder
+  indirectly, through the old sync folder they had once been
+  symlinked into. When the sync client was uninstalled, that folder
+  vanished, and every nightly run skipped all three paths with a
+  one-line warning and finished with success. Archives shrank from
+  roughly 68,000 to 88,000 files per machine to about 24,000. The
+  include lists now name the directories directly. See [Migrating Off
+  Dropbox](../sec-dropbox-to-portable-sync/) for the migration that
+  caused it.
+- **Secrets that were never included.** A review of the home
+  directory found `.env`, `.Renviron`, and `.aws` in no backup at all.
+  They were added, along with `.gnupg` and `.password-store`.
 
-python3 -m json.tool issues.json | head -50
-```
+## A job can fail every night without anyone noticing
 
-These checks confirm that the bundle is structurally
-valid, that metadata files are non-empty, that all
-branches are present, and that the issue export
-is well-formed JSON.
+- **A job that never ran.** A newly added OneDrive job on julia called
+  a script through `~/bin`, a folder of links into the dotfiles
+  repository, and the two new links had never been created. launchd
+  recorded exit status 78 (program not found) every night.
+- **A job silently unloaded.** After a restart, julia's Borg agent
+  was no longer loaded in launchd. The job file was intact; the job
+  simply was not scheduled. It was loaded again with `launchctl
+  bootstrap`.
+- **Invisible skips.** Before the `-E 75` change, a cloud run that
+  found the lock held exited 1 and wrote nothing, indistinguishable
+  from a real failure. julia's Google Drive copy skipped three nights
+  this way while a long manual run held the lock.
 
-![Organized workspace: the goal after archiving
-400 repos.](media/images/ambiance3.jpg){.img-fluid height=3.5in}
+## The network is part of the backup
 
-*After the archive, what remains on GitHub is clean
-and intentional.*
+- **An address change broke Borg on three machines.** The home server
+  rebooted and received new LAN addresses from the router. athena, joe,
+  and zeus still pointed at the old address, and their Borg runs failed
+  with connection timeouts for several nights. julia was unaffected
+  because it already used the server's Tailscale address. The first
+  fix updated `~/.ssh/config` and the runs still failed, because the
+  Borg script reads its own `~/.borg/ssh_config`. The Linux laptop was
+  found a day after the Macs, because the first status check covered
+  only the Macs. All machines now use the Tailscale address in both
+  files. Before trusting the new address, each machine confirmed that
+  the server's host key matched the key previously recorded for the
+  old one.
 
-# Daily Workflow
+## A fix needs checking on every machine it touches
 
-| Command | Action |
-|---------|--------|
-| `~/scripts/backup-research.sh --verbose` | Run ongoing backup with console output |
-| `tail -20 ~/Library/Logs/research_backup.log` | Review recent backup log entries |
-| `bash github-archive.sh --dry-run` | Preview what would be backed up or deleted |
-| `bash github-archive.sh` | Run full archival: backup, verify, confirm deletion |
-| `bash github-archive.sh --owner ORG` | Archive a different owner's repositories |
-| `git bundle verify repo.bundle` | Spot-check a specific archival bundle |
-| `gh repo list --json name` | Confirm which repositories remain on GitHub |
-| `crontab -l` | Verify that the 15-minute cron job is registered |
+- **The lock fix broke another machine.** The `-E 75` change calls
+  `flock` at its Homebrew path. joe had never installed it, so every
+  cloud run there now stopped immediately. Installing it revealed that
+  joe had never had rclone or a remote configured either: its cloud
+  jobs had been installed by a setup script and could never have
+  worked. They were removed. The script would be sturdier if a missing
+  lock tool produced a warning and an unlocked run.
+- **Symlink loops.** Removing the self-referencing link on one machine
+  fixed that machine. The same link existed in the same repository on
+  two others.
 
-Run the archival script quarterly or before any
-GitHub plan or account change. The ongoing backup
-script runs automatically once scheduled.
+## Settings chosen once cannot be changed later
+
+- **The unencrypted Time Machine backup.** Described above: encryption
+  must be selected when the destination is added.
 
 # Things to Watch Out For
 
-1. **Homebrew Bash path.** macOS ships with Bash 3.2,
-   which lacks features the backup script depends on.
-   Ensure the shebang points to
-   `/opt/homebrew/bin/bash` (Apple Silicon) or
-   `/usr/local/bin/bash` (Intel). Version mismatches
-   can cause silent failures that are difficult to
-   diagnose.
-
-2. **SSH key agent in cron.** Cron jobs do not inherit
-   your shell environment. If Git remotes use SSH,
-   the cron job may fail silently because `ssh-agent`
-   is not available. Add `eval "$(ssh-agent -s)"` to
-   the script or use macOS Keychain integration.
-
-3. **The `--limit 500` cap on `gh repo list`.** The
-   command defaults to 30 results. The archival script
-   sets it to 500, but if you have more repositories
-   than that, you need to increase the limit or
-   paginate manually.
-
-4. **Disk space surprises.** An initial estimate of
-   20 GB for 400 repos may prove insufficient; closer
-   to 35 GB may be needed if several repos have large
-   binary assets in their release history. Check with
-   `df -h` before starting.
-
-5. **Network interruptions during archival.** If a
-   clone fails midway, the `repo.git` directory exists
-   but is incomplete. The verification phase catches
-   this, but you must delete the partial clone and
-   rerun.
-
-6. **API rate limits.** GitHub's API allows 5,000
-   requests per hour for authenticated users. With
-   400 repos and 6 API calls each, that is 2,400
-   requests -- within the limit but close. If the
-   limit is reached, the script pauses without
-   automatic retry.
-
-7. **Time Machine drive connection.** Time Machine
-   requires the USB drive to be physically connected.
-   When travelling without the drive, this tier is
-   inactive. The Git push tier continues to operate
-   but cloud sync becomes the only off-site copy.
-
-# Uninstall / Rollback
-
-## Removing the Ongoing Backup System
-
-```bash
-crontab -e
-```
-
-Delete the line referencing `backup-research.sh`.
-Then remove the script:
-
-```bash
-rm -i ~/scripts/backup-research.sh
-```
-
-The log file can be removed independently:
-
-```bash
-rm -i ~/Library/Logs/research_backup.log
-```
-
-## Restoring from the GitHub Archive
-
-```bash
-cd ~/github-archive/repo-name
-git clone repo.bundle restored-repo
-
-gh repo create owner/repo-name --private
-cd restored-repo
-git remote add origin git@github.com:owner/repo-name.git
-git push --mirror origin
-```
-
-## Removing the Archive Script and Local Copies
-
-```bash
-rm -i github-archive.sh
-rm -ri ~/github-archive/
-```
-
-Confirm before removing backups: if GitHub has
-already been cleaned up, the local archive is the
-only copy.
+1. **Two SSH configurations, one address.** If the Borg script uses
+   its own SSH config, any change to the server's address or key must
+   be made in both files on every machine.
+2. **A general key in `~/.ssh/config` defeats a restricted key** unless
+   the backup uses `ssh -F` with `IdentitiesOnly yes`.
+3. **`--append-only` means prune from the server.** A client-side
+   prune appears to succeed and reclaims nothing.
+4. **Borg's exit code 1 is not a failure,** and a missing include path
+   is not an error. Read the `WARNING` lines, not just the exit code.
+5. **`rclone sync -L` and broken links.** One listing error disables
+   deletions for the run. Scan for loops before moving or uninstalling
+   anything under the backed-up tree.
+6. **Never point two machines at the same `rclone sync` destination.**
+7. **Time Machine encryption is a setup-time choice.**
+8. **`tmutil isexcluded` follows parents.** Check `SkipPaths` instead.
+9. **Scheduled jobs can disappear.** Check that every agent or timer
+   is still loaded, not only that its last run succeeded.
+10. **A Mac's night job may run in a dark wake without a network.**
+    Wait or retry before failing.
 
 # What Did We Learn?
 
 ## Lessons Learned
 
-**Conceptual Understanding:**
-
-- GitHub is a source-of-truth tier, not a backup
-  tier. A suspended account, a pricing change, or a
-  credential compromise can sever access immediately,
-  regardless of how many commits are in the history.
-- A single backup mechanism covers only one slice of
-  the risk surface. The combination of automated Git
-  pushes, cloud sync, Time Machine, and periodic
-  archival covers the full surface more reliably than
-  any one mechanism alone.
-- A plain `git clone` misses metadata that can be
-  more valuable than the code itself: issue
-  discussions, PR review threads, and release notes.
-- The three-phase archival pattern (backup, verify,
-  delete) is a general discipline applicable to any
-  destructive batch operation, not just GitHub
-  archiving.
-
-**Technical Skills:**
-
-- Bash `find` with `-print0` and `read -d ''` safely
-  handles directory names containing spaces and
-  special characters, which is common in research
-  project naming.
-- The `gh` CLI is more powerful than often expected.
-  Combining `gh repo list`, `gh api --paginate`, and
-  `gh release download` covers nearly every GitHub
-  operation without touching the web interface.
-- `git bundle verify` is a built-in safety net that
-  may be unfamiliar. It confirms the bundle is a
-  valid, complete repository.
-- Log rotation using file size checks (`stat -f%z`)
-  prevents unbounded log growth in long-running
-  automated scripts.
-
-**Gotchas and Pitfalls:**
-
-- Cron does not source `.bashrc` or `.zshrc`, so
-  environment variables, SSH keys, and PATH
-  modifications are not available unless explicitly
-  set within the script or the crontab.
-- The `--paginate` flag on `gh api` is critical.
-  Forgetting it silently loses issues beyond the
-  first 30 on larger repos.
-- GitHub wikis are technically separate git
-  repositories. They must be cloned independently,
-  and they silently fail if the wiki was enabled but
-  never populated.
-- `set -e` causes the archival script to exit on the
-  first error, which is good for safety but requires
-  `|| true` on commands that are expected to fail
-  (such as cloning an empty wiki).
+- **Independent tiers fail independently, but they also fail
+  silently.** Three mechanisms gave real redundancy; it was luck, not
+  design, that no data was lost while one tier or another was broken.
+- **Success status is not coverage.** Archive file counts, log
+  warnings, and destination sizes say more about a backup than its exit
+  code.
+- **Separation of keys is cheap and effective.** Per-host repositories,
+  restricted append-only keys, and passphrases kept off the storage
+  host mean that no single machine can destroy or read the whole
+  fleet's history.
+- **Manual retention is an acceptable price** for keeping decryption
+  keys off the server, provided it is on a schedule.
+- **Stable addressing belongs to the backup design.** Scripted traffic
+  should use addresses that do not change when a router reassigns a
+  lease.
 
 ## Limitations
 
-- The ongoing backup script only pushes to the
-  `origin` remote. Repositories using multiple
-  remotes receive backup to only one of them.
-- Auto-generated commit messages ('Auto-backup:
-  timestamp') lack descriptive content. This serves
-  the backup purpose but pollutes Git history for
-  active development branches.
-- The archival script does not handle GitHub Actions
-  workflow run history or Codespaces configurations,
-  which are not available through the standard API.
-- Repository settings (branch protection rules,
-  webhook configurations, deploy keys) are not
-  exported. Recreating those requires manual setup
-  or additional API calls.
-- Git LFS objects are not included in the mirror
-  clone by default. Repositories using LFS need
-  `git lfs fetch --all` added to the backup function.
-- The archival script processes repositories
-  sequentially. For 400+ repos, this can take several
-  hours. Parallelization would speed things up but
-  adds complexity.
-- Time Machine requires the USB drive to be
-  physically connected. When travelling without the
-  drive, this tier is inactive.
+- No automated alerting. Detection depends on someone running the
+  daily check.
+- The cloud tier covers only the project tree of two machines. The
+  remaining home-directory content of every machine has two copies
+  (the original and Borg), both in the same house, plus Time Machine
+  for the laptop.
+- The Borg repositories and the Time Machine share sit on the same
+  server. A fire or theft at home leaves the cloud copies of the
+  project tree as the only surviving tier.
+- Restores are tested file by file; a full bare-metal restore is the
+  test that matters most and the one least often performed.
+- rclone's default Google Drive client identifier is shared and
+  throttled; a dedicated API client is the durable configuration.
 
 ## Opportunities for Improvement
 
-1. Replace fixed commit messages in the ongoing
-   backup script with a brief summary of changed file
-   names, providing more informative Git history.
-2. Add Git LFS support to the archival script by
-   inserting `git lfs fetch --all` into the backup
-   function for repositories that use large file
-   storage.
-3. Parallelize the archival backup phase using
-   `xargs -P 4` or GNU `parallel` to clone multiple
-   repositories concurrently, reducing total runtime.
-4. Export repository settings (branch protection
-   rules, webhooks, deploy keys) so that restoration
-   is truly complete.
-5. Migrate from cron to `launchd` for better macOS
-   integration, including wake-from-sleep triggers and
-   retry logic.
-6. Add a companion `github-restore.sh` script that
-   reads a backup directory and recreates
-   repositories on GitHub, including metadata
-   re-import.
-7. Add compression: after archival verification,
-   compress each repository directory with `tar -czf`
-   to reduce storage requirements by roughly 50-70%.
+1. A daily monitoring job that reports any non-zero exit status, any
+   unloaded agent, or any log older than a day, on every machine.
+2. Connectivity checks with retry at the start of each backup script.
+3. An off-site copy of the Borg repositories themselves (for example,
+   a second encrypted repository at a cloud provider), which would
+   close the single-site limitation for the whole fleet.
+4. A scripted quarterly restore drill that extracts a fixed sample of
+   files from each tier and compares checksums.
+5. The `flock` dependency made optional, so a missing lock tool
+   degrades to a warning.
 
 # Wrapping Up
 
-The two components in this post address different
-timescales of the same underlying concern: ensuring
-that research work is recoverable regardless of what
-fails. The ongoing three-tier system handles the
-daily rhythm, committing and pushing every 15
-minutes while Time Machine and cloud sync provide
-complementary coverage. The archival procedure
-handles the periodic task of verifying that GitHub
-itself -- the source-of-truth tier -- has a local
-mirror that would survive the loss of the account.
-
-The most important lesson is not about any specific
-tool but about the architecture: no single backup
-mechanism is sufficient, verification must be part of
-the process rather than assumed, and automation is
-the only reliable way to maintain discipline across
-hundreds of repositories over months and years.
+The architecture is simple to state: Borg nightly to a home server
+through keys that cannot delete, cloud copies of the projects with a
+history of deletions, and an encrypted Time Machine share for the
+laptop. The hard part was never the design. It was noticing, without
+any alert, that a tier had stopped working.
 
 Main takeaways:
 
-- GitHub is not a backup. It is one copy, held by one
-  company. The backup architecture is everything
-  surrounding it.
-- Three independent ongoing tiers (Git push, cloud
-  sync, Time Machine) cover the full spectrum of
-  daily failure modes.
-- The three-phase archival pattern (backup, verify,
-  delete) prevents data loss from incomplete archives
-  and ensures deletions are irreversible only after
-  confirmation.
-- A 400-repo archive takes roughly 2-4 hours and
-  20-40 GB of disk space depending on repo sizes.
+- Give every client its own repository, passphrase, and restricted
+  append-only key, and keep passphrases off the storage host.
+- Use `ssh -F` with a dedicated configuration so the restricted key is
+  the one actually offered.
+- Give each machine its own cloud destination and keep deleted files
+  with `--backup-dir`.
+- Choose Time Machine encryption when adding the destination; it
+  cannot be added later.
+- Check every job's exit status on every machine daily, and restore
+  from every tier quarterly.
 
 # See Also
 
-**Related posts on this blog:**
+Security series:
 
-- [Unix Command-Line Workspace Setup for Data Science
-  Development](
-  ../wf-unix-workspace-config/)
-  -- the terminal and shell setup that complements
-  this backup architecture.
-- [Setting Up Git for Data Science Workflows](
-  ../wf-git-for-data-science/)
-- [Multi-Laptop macOS Bootstrap](
-  ../wf-multi-laptop-dotfiles-bootstrap/)
+1. [Security Foundations for a Multi-Machine Research Fleet](../sec-multi-laptop-threat-model/)
+2. [Setting Up pass: a Unix Password Manager](../sec-pass-password-manager/)
+3. [Secrets Management for the Workflow Construct](../sec-aws-and-pass-secrets/)
+4. [Migrating Off Dropbox: Beyond Dotfiles](../sec-dropbox-to-portable-sync/)
+5. Research Backup Architecture: Borg, Cloud Copies, and Time Machine (this post)
+6. [A Home Server for a Five-Machine Research Fleet](../sec-five-machine-storage/)
+7. [Object Storage for Research Data: The Layer Git Cannot Hold](../sec-object-store-research-data/)
+8. [Running the Quarterly Security Audit for the First Time: What Actually Broke](../sec-fleet-hardening-lessons/)
 
-**Key resources:**
+External references:
 
-- [GitHub CLI Documentation](
-  https://cli.github.com/manual/)
-- [Git Bundle Documentation](
-  https://git-scm.com/docs/git-bundle)
-- [GitHub REST API: Repositories](
-  https://docs.github.com/en/rest/repos)
-- [Pro Git Book (free)](https://git-scm.com/book/en/v2)
-  -- authoritative reference for Git concepts
-- [Apple Time Machine Documentation](
-  https://support.apple.com/en-us/104984)
-  -- official setup and troubleshooting guide
-- [Crontab Guru](https://crontab.guru/)
-  -- interactive cron schedule expression editor
-- [Homebrew](https://brew.sh/)
-  -- macOS package manager for installing Bash 5 and
-  other tools
-- [Git LFS Documentation](https://git-lfs.github.com/)
+- [Borg documentation](https://borgbackup.readthedocs.io/): `borg
+  serve`, `--append-only`, and `prune`.
+- [rclone sync](https://rclone.org/commands/rclone_sync/) and the
+  [`--backup-dir` flag](https://rclone.org/docs/#backup-dir-dir).
+- [Samba `vfs_fruit`](https://www.samba.org/samba/docs/current/man-html/vfs_fruit.8.html):
+  the module that serves Time Machine.
+- [`tmutil` manual page](https://ss64.com/mac/tmutil.html).
 
 # Reproducibility
 
-**Environment requirements:**
+The configuration excerpts are trimmed from the scripts in use on
+2026-10-01; account names, addresses, and some excludes are replaced
+or omitted.
 
-- macOS 12 (Monterey) or later; tested on macOS 14
-  Sonoma
-- Bash 5.x via Homebrew (macOS ships 3.2; install
-  with `brew install bash`)
-- Git 2.39 or later
-- `gh` CLI 2.40 or later
+| Component | Version |
+|---|---|
+| macOS | 26.6 |
+| Linux Mint | 22.3 |
+| Borg | 1.4.5 |
+| rclone | 1.75 |
+| flock (Homebrew) | 0.4.0 |
+| Samba (server) | 4.19 with `vfs_fruit` |
 
-**Version checks:**
-
-```bash
-git --version
-gh --version
-bash --version
-```
-
-**Script files:**
-
-| File                      | Description                  |
-|---------------------------|------------------------------|
-| `backup-research.sh`      | Ongoing 15-minute backup     |
-| `github-archive.sh`       | Bulk archival script         |
-| `archive_YYYYMMDD.log`    | Archival execution log       |
-| `research_backup.log`     | Ongoing backup log           |
-
-This post does not use R or Docker. The entire
-workflow is pure Bash with the GitHub CLI and macOS
-system tools.
+The restore commands in the Restore Testing section use an
+illustrative archive name and path; substitute a real archive from
+`borg list`. Commands that require `sudo` are marked as such.
 
 # Let's Connect
 
-*Have questions, suggestions, or spot an error? Let me
-know.*
+*Questions, suggestions, or corrections are welcome.*
 
 - **GitHub:** [rgt47](https://github.com/rgt47)
 - **Twitter/X:** [@rgt47](https://twitter.com/rgt47)
-- **LinkedIn:** [Ronald Glenn Thomas](
-  https://linkedin.com/in/rgthomaslab)
+- **LinkedIn:** [Ronald Glenn Thomas](https://linkedin.com/in/rgthomaslab)
 - **Email:** [Contact form](https://rgtlab.org/contact)
 
-I would enjoy hearing from you if:
+I would like to hear from you if:
 
-- You spot an error or a better approach to any of
-  the code in this post.
-- You have suggestions for topics you would like to
-  see covered.
-- You want to discuss R programming, data science, or
-  reproducible research.
-- You have questions about anything in this tutorial.
-- You just want to say hello and connect.
-
----
-
-*Rendered on 2026-05-17 at 17:08 PDT.*<br>
-*Source: ~/prj/rgtlab/posts/sec-three-tier-backup-architecture/index.qmd*
+- You find an error, or a better approach to anything in this series.
+- You run a small research fleet and have found where this design
+  breaks.
+- You want to compare notes on backups, secrets, or reproducible
+  research infrastructure.
