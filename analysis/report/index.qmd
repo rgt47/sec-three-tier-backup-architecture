@@ -136,7 +136,7 @@ exit statuses by hand.
 5. Each tier is verified by restoring from it, and each job's exit
    status is checked daily on every machine.
 
-![  ](media/images/ambiance1.png){.img-fluid}
+![  ](media/images/ambiance1.jpg){.img-fluid}
 
 # What is a Research Backup Architecture?
 
