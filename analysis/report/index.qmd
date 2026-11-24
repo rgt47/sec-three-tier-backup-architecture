@@ -43,7 +43,11 @@ AUTHOR PROVIDES
       target (C9), password-store mirror remedy (C10), first prune
       date (C8), cause of the Google Drive token loss (C15), Time
       Machine under a locked session (C14), athena's Drive client ID
-      and the duplicate objects (C5).
+      (C5).
+  [x] Correction of 2026-11-21: server-side Borg staleness check,
+      zeus's catch-up run before the network, the removable-drive
+      include path, and the dedupe of julia's Drive mirror (done
+      2026-11-21, phb228 folder only).
   [ ] Author to confirm the correction's wording and tone.
   [x] Images: hero + 3 ambiance present in media/images/.
 ============================================================================ -->
@@ -52,6 +56,40 @@ AUTHOR PROVIDES
 
 *Three copies, two kinds of media, one off site: the rule is old,
 and the hard part is knowing that all three are still current.*
+
+::: {.callout-note title="Updated 2026-11-23"}
+A third set of changes, made in the body below:
+
+- **Append-only is not delete-proof.** Borg's append-only mode records
+  a client's deletion and keeps the data, so it can be rolled back,
+  but it does not refuse the deletion. The server also keeps dated,
+  root-owned hardlink snapshots of every repository, out of reach of
+  any client key. This post had not described them.
+- **The path to the server.** The backup's SSH configuration now tries
+  the server's LAN name first and falls back to Tailscale, after
+  Tailscale failing to start on two Macs cost weeks of backups.
+- **An encrypted off-site copy of `~/docs`**, added in November, and
+  the way its first restore test stopped it.
+- **Retention.** The prune script is now installed on the server; the
+  first quarterly pass is still due in December.
+:::
+
+::: {.callout-note title="Updated 2026-11-21"}
+A second round of November changes, made in the body below:
+
+- **Monitoring.** The server also checks every Borg repository for a
+  recent archive, a check this post had omitted. It caught the Linux
+  laptop after the laptop was switched off over a backup night.
+- **Scheduling.** That laptop's catch-up run started at boot, before
+  its network was up, and failed. A Linux user timer cannot wait for
+  the system's network target; the job now waits for the server
+  itself.
+- **Tier 2.** The duplicate names on Google Drive were resolved, and
+  what `rclone dedupe` did on the way is described.
+- **What broke** and **Things to Watch Out For** gain these incidents,
+  and a removable drive that left the include list short for five
+  nights.
+:::
 
 ::: {.callout-note title="Updated 2026-11-16"}
 A review of the fleet's backups in November found failures this post
@@ -174,10 +212,10 @@ regenerable or held elsewhere.
   for each provider.
 - A password manager that every client can read. This fleet uses
   `pass`; see [Setting Up pass](../sec-pass-password-manager/).
-- A home server reachable at a stable address. This fleet uses
-  Tailscale addresses for all scripted traffic; see [A Home Server for
-  a Five-Machine Research Fleet](../sec-five-machine-storage/) for the
-  server itself.
+- A home server reachable at a stable address. This fleet's backups
+  try the server's LAN name first and fall back to its Tailscale
+  address; see [A Home Server for a Five-Machine Research
+  Fleet](../sec-five-machine-storage/) for the server itself.
 - Full-disk encryption on every machine, so that the plaintext source
   of each backup is itself protected at rest.
 
@@ -191,7 +229,7 @@ in turn backs up its own home directory and the folders it serves to a
 repository on julia, so the server is never the only place its own
 data lives.
 
-Three properties make this tier robust against a compromised client:
+Four properties make this tier robust against a compromised client:
 
 1. **Encryption with a per-repository passphrase.** Each repository
    uses Borg's `repokey` mode with its own passphrase. Every
@@ -206,17 +244,28 @@ Three properties make this tier robust against a compromised client:
    ```text
    command="/usr/local/bin/borg serve --append-only \
      --restrict-to-repository /srv/backup/julia",restrict ssh-ed25519 \
-     AAAA... borg-julia
+     AAAA... <comment>
    ```
 
    (Wrapped here for width; in `authorized_keys` it is one line.)
    The `restrict` option disables port forwarding, agent forwarding,
    and terminal allocation. `--restrict-to-repository` confines the
-   key to one repository. `--append-only` means the key can add
-   archives but cannot remove data already written. A thief or a piece
-   of ransomware holding a client can write garbage into that client's
-   repository; it cannot delete last month's archives.
-3. **A separate SSH configuration for the backup.** This one is easy
+   key to one repository. `--append-only` means that data already
+   written stays in the repository's segment files: a deletion by the
+   client is recorded as a new transaction, which an administrator can
+   roll back. It does not refuse the deletion, and a test on this
+   fleet confirmed that a client key can delete its own archive. So
+   the server adds the next property.
+3. **Root-owned snapshots on the server.** Each night at 03:30, after
+   every client has finished, a root timer on the server writes a
+   dated copy of all the repositories into a directory only root can
+   read, using hard links so that unchanged files cost no space. No
+   client credential can reach it. A thief or a piece of ransomware
+   holding a client can damage that client's repository; last night's
+   snapshot of it survives. The snapshots share the server's disk, so
+   they protect against a compromised client, not against losing the
+   server.
+4. **A separate SSH configuration for the backup.** This one is easy
    to get wrong. A typical `~/.ssh/config` already has an entry for the
    server with a general-purpose key. SSH offers keys from the config
    entry first, and `IdentityFile` is cumulative, so passing `-i` or
@@ -230,7 +279,7 @@ Three properties make this tier robust against a compromised client:
    Host mercury
      HostName <tailscale-address>
      User <user>
-     IdentityFile ~/.ssh/id_ed25519_borg_julia
+     IdentityFile ~/.ssh/<backup-key>
      IdentitiesOnly yes
      UserKnownHostsFile ~/.ssh/known_hosts
      StrictHostKeyChecking yes
@@ -241,7 +290,11 @@ Three properties make this tier robust against a compromised client:
    than hang a scheduled run. The consequence of a second configuration
    file is that the server's address now lives in two places on each
    machine, a point that mattered later (see [What broke, and how it was
-   found](#what-broke)).
+   found](#what-broke)). Since November the file on the Macs begins
+   with a test: if the server's SSH port answers on its LAN name within
+   three seconds, the backup goes over the LAN; otherwise it uses the
+   Tailscale address. Neither an address change nor Tailscale stopping
+   on one Mac now stops that Mac's backup.
 
 ## The backup script
 
@@ -322,7 +375,38 @@ Both hand the script a minimal `PATH`, which is why it locates the
 A Mac that is asleep at 02:00 runs the job at its next wake. If that
 wake is a brief maintenance wake on battery, the network may not be up
 yet, and the run fails on a connection timeout. A backup script should
-wait for, or retry, connectivity before declaring failure.
+wait for, or retry, connectivity before declaring failure. Even a run
+that starts cleanly can be cut off: on 2026-11-23 julia, left on
+battery, began its run in a maintenance wake, went back to sleep, and
+lost its connection to the server partway through, although the script
+asks macOS to prevent idle sleep for its duration. The working rule is
+that a Mac with a night job stays on mains power overnight.
+
+The Linux timers behave the same way. With `Persistent=true`, a
+machine that was off at the scheduled time runs the missed job as
+soon as it boots, which on the Linux laptop in November was 98 seconds
+after power-on, before Wi-Fi and Tailscale were up. The usual systemd
+remedy, `After=network-online.target`, does not apply: the job runs
+as a *user* unit, and a user manager has no access to that system
+target, so the line is accepted and ignored. Even in a system unit it
+would not cover Tailscale, which is the path to the server. The unit
+therefore waits for the server itself, by probing its SSH port, and
+gives up waiting after ten minutes so that a real outage still runs
+the job, fails, and alerts:
+
+```ini
+# ~/.config/systemd/user/borg-backup.service (excerpt)
+[Service]
+Type=oneshot
+# '-' ignores this step's status; '$$' is a literal '$' in a unit.
+ExecStartPre=-/bin/bash -c 'h=$$(sed -n "s/^ *HostName *//p" \
+  %h/.borg/ssh_config | head -1); for i in $$(seq 40); do \
+  nc -z -w 3 "$$h" 22 && exit 0; sleep 15; done'
+ExecStart=/bin/bash %h/dotfiles/bin/borg-backup
+```
+
+The address comes from the backup's own SSH configuration, so the
+probe follows the server if it moves.
 
 ## Retention
 
@@ -355,8 +439,8 @@ In November 2026 the four client repositories on the server held
 about 90 GiB together, the largest 33 GiB. They were created in
 September, so the first quarterly pass falls in December and has not
 yet run. One practical gap surfaced while checking: `borg-prune` had
-been installed only on julia, so it must be copied to the server
-before that first pass.
+been installed only on julia. It has since been installed on the
+server as well, which holds the four client repositories.
 
 ![  ](media/images/ambiance2.jpg){.img-fluid}
 
@@ -527,6 +611,42 @@ julia's mirror carried several hundred of them in November.
 `rclone dedupe` resolves them, and its interactive mode shows each
 pair before acting.
 
+On julia every one of the nightly notices came from a single course
+folder, and a dry run there found about 2,000 duplicate pairs. All but
+15 were byte-identical, so the copy to delete did not matter. The 15
+that differed were lecture sources; `--dedupe-mode newest` kept the
+newer copy without prompting, which is safe on a mirror because the
+next nightly sync re-uploads any file that still differs from the
+workstation's. Two things about the real run were not visible in the
+dry run. It first merged several hundred duplicate *folders*, one file
+move at a time, for close to an hour. It reports each merge only at
+the `INFO` level, so at the default level it printed nothing for ten
+minutes and looked hung; a Go stack dump (`kill -QUIT`) showed it
+inside the merge, and a rerun with `-v` showed its progress. And
+Google Drive moves deleted copies to its trash,
+which keeps them recoverable for 30 days. Whether other folders on the
+mirror also hold duplicates was not checked.
+
+## An encrypted off-site copy of `~/docs`
+
+The project mirrors leave out `~/docs`, which holds financial, legal
+and identity documents that should not sit readable on a provider's
+servers. Since November 2026 a separate nightly job on julia keeps a
+local Borg repository of `~/docs`, in `repokey` mode with its own
+passphrase, prunes it (14 daily, 8 weekly, 24 monthly), and mirrors
+the repository directory to Google Drive. The provider sees only
+encrypted chunks. The job refuses an empty source, refuses to mirror a
+repository that lists no archives, and caps deletions on the mirror.
+
+Its first restore test taught a lesson that applies to any Borg
+repository. Borg remembers where it last saw each repository, per user,
+and refuses a repository that seems to have moved. Opening a
+downloaded *copy* of the repository as the same user on the same
+machine rewrote that record, and from the next night the job refused
+the real repository as relocated. Restore tests of a copy should run
+with a scratch Borg home (`BORG_BASE_DIR`), as in [Restore
+Testing](#restore-testing) below.
+
 # Tier 3: Time Machine
 
 Time Machine protects athena, the laptop, which is the machine most
@@ -646,10 +766,13 @@ that matters for this tier is the staleness alert described under
 [Monitoring](#monitoring), which catches any cause, including ones
 not yet found.
 
-# Restore Testing
+# Restore Testing {#restore-testing}
 
 A backup that has never been restored is a hypothesis. Each tier has a
-cheap test that belongs in the quarterly audit:
+cheap test that belongs in the quarterly audit. When the test opens a
+*copy* of a repository, run it with `export BORG_BASE_DIR="$(mktemp
+-d)"` first, so that the test cannot change Borg's record of where the
+real repository lives (see the `~/docs` copy above):
 
 ```bash
 # Borg: list archives, verify repository consistency, and restore a
@@ -695,6 +818,17 @@ There is now some, and the gaps in it are instructive:
   destination is unmounted, and that is most of the time. A
   staleness check catches failures that report no error at all,
   which is why it, rather than a failure hook, suits this tier.
+- **Borg is also checked for staleness, from the server.** The
+  failure notification above is sent by the client, so it cannot
+  report a client that never ran: one that was off, asleep, or had
+  lost its timer. A daily job on the server reads each repository's
+  newest index file, whose modification time is the time of the last
+  archive and which can be read without the passphrase, and sends a
+  notification when it is more than 20 hours old, then again every
+  20 hours, and once more when the repository recovers. In November
+  it was the only alert for a laptop that had been switched off over
+  a backup night: the laptop's own failure notification at the next
+  boot was not delivered, because name resolution was not up yet.
 - **The cloud copies do not alert.** They were the tier that failed
   most in November, for the reasons above.
 
@@ -745,6 +879,14 @@ They are grouped by the lesson they teach.
 - **Secrets that were never included.** A review of the home
   directory found `.env`, `.Renviron`, and `.aws` in no backup at all.
   They were added, along with `.gnupg` and `.password-store`.
+- **A removable drive in the include list** *(November 2026)*. An
+  archive folder on an external USB drive, with no other copy, was
+  added to julia's include list. When the drive was disconnected, the
+  nightly run skipped it with the usual one-line warning and finished
+  with success, for five nights, with no alert. Reconnecting the drive
+  and running Borg by hand restored it. A path that is only sometimes
+  present needs either a check that warns when it is absent or a
+  separate job that runs when the drive is attached.
 
 ## A job can fail every night without anyone noticing
 
@@ -779,15 +921,28 @@ They are grouped by the lesson they teach.
   fix updated `~/.ssh/config` and the runs still failed, because the
   Borg script reads its own `~/.borg/ssh_config`. The Linux laptop was
   found a day after the Macs, because the first status check covered
-  only the Macs. All machines now use the Tailscale address in both
+  only the Macs. All machines then used the Tailscale address in both
   files. Before trusting the new address, each machine confirmed that
   the server's host key matched the key previously recorded for the
   old one.
+- **Tailscale not running** *(October and November 2026)*. That
+  choice moved the dependency rather than removing it: when Tailscale
+  failed to start at login on two Macs, their backups failed every
+  night for more than two weeks. The backup's configuration now tries
+  the LAN name first and uses Tailscale only as the fallback.
 - **A night without DNS** *(November 2026)*. launchd starts a missed
   job the moment a Mac wakes. On one night both Macs woke for the
   02:00 Google Drive job before name resolution was working, and
   both runs failed in seconds with `no such host`. The wrapper now
   waits up to five minutes for the provider's login host to answer.
+- **A catch-up run at boot** *(November 2026)*. The Linux laptop was
+  powered off in the early afternoon and stayed off through its 03:00
+  backup. When it was switched on the next morning, its timer ran the
+  missed job immediately; Borg failed with `Network is unreachable`,
+  and the failure notification failed too, for lack of DNS. The
+  server's staleness check reported the missing archive. The unit now
+  waits for the server (see Scheduling), and a manual run that
+  morning completed normally.
 - **A firewall that hid the share** *(November 2026)*. The server's
   firewall dropped the unicast Bonjour queries that Time Machine uses
   to find its destination, and athena logged over a hundred failed
@@ -852,7 +1007,21 @@ They are grouped by the lesson they teach.
 14. **`rclone sync` mirrors an empty source.** Refuse to start on an
     empty source, and cap deletions with `--max-delete`.
 15. **Google Drive permits duplicate names.** rclone skips them and
-    still reports success; `rclone dedupe` resolves them.
+    still reports success; `rclone dedupe` resolves them. Expect a
+    long, silent folder-merge phase that the dry run does not show.
+16. **`After=network-online.target` does nothing in a systemd user
+    unit.** A `Persistent=true` timer runs a missed job at boot; make
+    the job wait for the host it needs.
+17. **A failure alert sent by the client cannot report a client that
+    never ran.** Check freshness from the server as well.
+18. **Removable drives in an include list fail quietly.** Their
+    absence is a warning, not an error.
+19. **`--append-only` does not refuse deletion.** It makes deletion
+    reversible by an administrator; keep copies the client cannot
+    reach, such as root-owned snapshots.
+20. **A restore test can break the backup it tests.** Opening a copy
+    of a repository rewrites Borg's record of its location; test with
+    a scratch `BORG_BASE_DIR`.
 
 # What Did We Learn?
 
@@ -871,24 +1040,28 @@ They are grouped by the lesson they teach.
 - **Manual retention is an acceptable price** for keeping decryption
   keys off the server, provided it is on a schedule.
 - **Stable addressing belongs to the backup design.** Scripted traffic
-  should use addresses that do not change when a router reassigns a
-  lease.
+  should not depend on an address a router can reassign, nor on a
+  single overlay network that can fail to start; a LAN path with an
+  overlay fallback survives either failure.
 - **A backup reports one failure at a time.** Each fix to athena's
   Time Machine uncovered the next fault. An alert on staleness, which
   fires whatever the cause, is worth more than any single fix.
 
 ## Limitations
 
-- Alerting is partial. Borg failures and a stale Time Machine backup
-  produce a notification; a failing cloud copy still depends on
-  someone running the daily check.
-- The cloud tier covers only the project tree of two machines. The
-  remaining home-directory content of every machine has two copies
-  (the original and Borg), both in the same house, plus Time Machine
-  for the laptop.
-- The Borg repositories and the Time Machine share sit on the same
-  server. A fire or theft at home leaves the cloud copies of the
-  project tree as the only surviving tier.
+- Alerting is partial. Borg failures, a stale Borg repository, and a
+  stale Time Machine backup produce a notification; a failing cloud
+  copy still depends on someone running the daily check. The wait
+  for the server in the Linux unit has been tested only with the
+  server reachable; the ten-minute fallback has not been exercised.
+- The cloud tier covers the project tree of two machines and, as an
+  encrypted Borg repository, `~/docs`. The remaining home-directory
+  content of every machine has two copies (the original and Borg),
+  both in the same house, plus Time Machine for the laptop.
+- The Borg repositories, their snapshots and the Time Machine share
+  sit on the same server. A fire or theft at home leaves the cloud
+  copies of the project tree and of `~/docs` as the only surviving
+  tiers.
 - Restores are tested file by file; a full bare-metal restore is the
   test that matters most and the one least often performed.
 - rclone's default Google Drive client identifier is shared and
@@ -923,9 +1096,10 @@ They are grouped by the lesson they teach.
 # Wrapping Up
 
 The architecture is simple to state: Borg nightly to a home server
-through keys that cannot delete, cloud copies of the projects with a
-history of deletions, and an encrypted Time Machine share for the
-laptop. The hard part was never the design. It was noticing, without
+through restricted append-only keys, with root-owned snapshots the
+keys cannot reach, cloud copies of the projects with a history of
+deletions and an encrypted off-site copy of `~/docs`, and an
+encrypted Time Machine share for the laptop. The hard part was never the design. It was noticing, without
 any alert, that a tier had stopped working.
 
 Main takeaways:
@@ -988,7 +1162,7 @@ illustrative archive name and path; substitute a real archive from
 
 ---
 
-*Rendered on 2026-11-16 at 08:54 PST.*<br>
+*Rendered on 2026-11-23 at 17:52 PST.*<br>
 *Source: ~/prj/web/ryyblog/posts/sec-three-tier-backup-architecture/analysis/report/index.qmd*
 
 <!-- ============================================================================
